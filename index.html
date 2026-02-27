@@ -43,10 +43,10 @@
         const { useState, useEffect } = React;
 
         // ローカルストレージキー
-        const STORAGE_KEY = 'tax_simulator_data_v4'; // v4: 中間消費税・法人税中間申告追加
+        const STORAGE_KEY = 'tax_simulator_data_v5'; // v5: 画面から機能設定可能に
 
-        // 初期会社データ
-        const createInitialCompany = (id, name) => ({
+        // 初期会社データ（settingsでデフォルト社保料率を指定可能）
+        const createInitialCompany = (id, name, settings = DEFAULT_SETTINGS) => ({
             id,
             name,
             isTaxable: true, // 課税事業者
@@ -85,8 +85,8 @@
             
             // 社会保険（役員報酬・給与それぞれに対して計算）
             includeSocialInsurance: true,
-            executiveSocialInsurancePercent: 15,
-            salarySocialInsurancePercent: 15,
+            executiveSocialInsurancePercent: settings.defaultSocialInsuranceRate ?? 15,
+            salarySocialInsurancePercent: settings.defaultSocialInsuranceRate ?? 15,
 
             // ① 期首現金（年初残高）
             beginningCash: 0,
@@ -216,8 +216,16 @@
             return { isRequired, scheduledNationalTax, scheduledLocalTax, scheduledTotal, provisionalNationalTax, provisionalLocalTax, provisionalTotal, rateBasis, provisionalNote, hasProvisionalInput: income6m !== 0 };
         };
 
-        // 計算関数
-        const calculateKPI = (company, year, month) => {
+        // デフォルト設定（画面で変更可能）
+        const DEFAULT_SETTINGS = {
+            consumptionTaxRate: 10,       // 消費税率（%）
+            defaultSocialInsuranceRate: 15, // 新規会社のデフォルト社保料率（%）
+            showIntermediateTaxSection: true, // 中間申告セクション表示
+            showMonthlyCFSection: true   // 月次CFセクション表示
+        };
+
+        // 計算関数（settingsを渡す場合は使用、未指定時はDEFAULT_SETTINGS）
+        const calculateKPI = (company, year, month, settings = DEFAULT_SETTINGS) => {
             const { revenue, isTaxable, includeSocialInsurance,
                     // 役員報酬
                     executiveCompensation, executiveCompensationInputMode, executiveCompensationPercent,
@@ -329,16 +337,14 @@
             // 消費税計算
             // ============================================================
             
-            // 預かり消費税（売上×10%）
-            const receivedConsumptionTax = revenue * 0.1;
-            
+            const taxRate = (settings.consumptionTaxRate || 10) / 100;
+            // 預かり消費税（売上×消費税率）
+            const receivedConsumptionTax = revenue * taxRate;
             // 支払消費税（仕入控除：販管費＋外注費）
-            // ※人件費（役員報酬・給与）は消費税の対象外
-            // ※免税事業者等からの仕入れは経過措置に基づき一部控除可能（図表1参照）
             const taxExemptDeductionRate = getTaxExemptDeductionRate(year, month);
-            const paidConsumptionTax = (actualExpenseWithInvoice * 0.1) + (actualOutsourcingWithInvoice * 0.1)
-                + (actualExpenseWithoutInvoice * 0.1 * taxExemptDeductionRate)
-                + (actualOutsourcingWithoutInvoice * 0.1 * taxExemptDeductionRate);
+            const paidConsumptionTax = (actualExpenseWithInvoice * taxRate) + (actualOutsourcingWithInvoice * taxRate)
+                + (actualExpenseWithoutInvoice * taxRate * taxExemptDeductionRate)
+                + (actualOutsourcingWithoutInvoice * taxRate * taxExemptDeductionRate);
             
             // 消費税納付額 = 預かり消費税 - 支払消費税
             const consumptionTax = isTaxable 
@@ -349,19 +355,18 @@
             // キャッシュフロー計算（税込ベース）
             // ============================================================
             
+            const taxMultiplier = 1 + taxRate;
             // 【キャッシュイン】
-            // 税込売上（実際の入金額）
-            const taxIncludedRevenue = revenue * 1.1;
+            const taxIncludedRevenue = revenue * taxMultiplier;
             
             // 【キャッシュアウト】
             // 1. 人件費（非課税なのでそのまま）
             const cashOutLabor = totalLaborCost;
             
             // 2. 販管費（税込）
-            const cashOutExpense = (actualExpenseWithInvoice + actualExpenseWithoutInvoice) * 1.1;
-            
+            const cashOutExpense = (actualExpenseWithInvoice + actualExpenseWithoutInvoice) * taxMultiplier;
             // 3. 外注費（税込）
-            const cashOutOutsourcing = (actualOutsourcingWithInvoice + actualOutsourcingWithoutInvoice) * 1.1;
+            const cashOutOutsourcing = (actualOutsourcingWithInvoice + actualOutsourcingWithoutInvoice) * taxMultiplier;
             
             // 4. 法人税
             const cashOutCorporateTax = corporateTax;
@@ -424,8 +429,8 @@
         // サイト: 0日=当月, 30日=翌月, 60日=2ヶ月後, 90日=3ヶ月後
         const getMonthOffset = (days) => Math.floor((days || 0) / 30);
 
-        const calculateMonthlyCashFlow = (company, year) => {
-            const kpi = calculateKPI(company, year, 1); // 1月基準で税額算出
+        const calculateMonthlyCashFlow = (company, year, settings = DEFAULT_SETTINGS) => {
+            const kpi = calculateKPI(company, year, 1, settings);
             const {
                 taxIncludedRevenue,
                 corporateTax,
@@ -446,10 +451,10 @@
             const corporateTaxMonth = company.corporateTaxMonth || 3;
             const consumptionTaxMonth = company.consumptionTaxMonth || 3;
 
-            // 月額（年額÷12）。販管費=外注費+その他販管費、給与=役員報酬+給与+社保
+            const taxMultiplier = 1 + (settings.consumptionTaxRate || 10) / 100;
             const monthlySales = taxIncludedRevenue / 12;
             const monthlyExpense = (actualExpenseWithInvoice + actualExpenseWithoutInvoice
-                + actualOutsourcingWithInvoice + actualOutsourcingWithoutInvoice) * 1.1 / 12;
+                + actualOutsourcingWithInvoice + actualOutsourcingWithoutInvoice) * taxMultiplier / 12;
             const monthlyLabor = (actualExecutiveCompensation + actualSalary
                 + (company.includeSocialInsurance ? totalSocialInsuranceCost : 0)) / 12;
 
@@ -475,8 +480,8 @@
         };
 
         // ⑥ グループ合算CF（全社の月次を単純合算）
-        const calculateGroupMonthlyCF = (companies, year) => {
-            const monthlyData = companies.map(c => calculateMonthlyCashFlow(c, year));
+        const calculateGroupMonthlyCF = (companies, year, settings = DEFAULT_SETTINGS) => {
+            const monthlyData = companies.map(c => calculateMonthlyCashFlow(c, year, settings));
             const result = [];
             const groupBeginningCash = companies.reduce((sum, c) => sum + (c.beginningCash || 0), 0);
             let balance = groupBeginningCash;
@@ -495,7 +500,7 @@
         };
 
         // グループ合算計算（従来KPI用）
-        const calculateGroupTotal = (companies, year, month) => {
+        const calculateGroupTotal = (companies, year, month, settings = DEFAULT_SETTINGS) => {
             const totals = {
                 operatingProfit: 0,
                 consumptionTax: 0,
@@ -509,7 +514,7 @@
             };
 
             companies.forEach(company => {
-                const kpi = calculateKPI(company, year, month);
+                const kpi = calculateKPI(company, year, month, settings);
                 totals.operatingProfit += kpi.operatingProfit;
                 totals.consumptionTax += kpi.consumptionTax;
                 totals.receivedConsumptionTax += kpi.receivedConsumptionTax;
@@ -632,7 +637,9 @@
             // 状態管理
             const [year, setYear] = useState(2025);
             const [month, setMonth] = useState(1);
-            const [companies, setCompanies] = useState([createInitialCompany(1, '会社1')]);
+            const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+            const [showSettingsModal, setShowSettingsModal] = useState(false);
+            const [companies, setCompanies] = useState([createInitialCompany(1, '会社1', DEFAULT_SETTINGS)]);
             const [selectedCompanyId, setSelectedCompanyId] = useState(1);
             const [showGroupView, setShowGroupView] = useState(true);
             const [nextId, setNextId] = useState(2);
@@ -641,6 +648,7 @@
             useEffect(() => {
                 try {
                     let saved = localStorage.getItem(STORAGE_KEY);
+                    if (!saved) saved = localStorage.getItem('tax_simulator_data_v4');
                     if (!saved) saved = localStorage.getItem('tax_simulator_data_v3');
                     if (!saved) saved = localStorage.getItem('tax_simulator_data_v2');
                     if (!saved) saved = localStorage.getItem('tax_simulator_data_v1');
@@ -648,6 +656,7 @@
                         const data = JSON.parse(saved);
                         setYear(data.year || 2025);
                         setMonth(data.month || 1);
+                        setSettings({ ...DEFAULT_SETTINGS, ...data.settings });
                         // 古いデータとの互換性のためデフォルト値を設定
                         const companiesWithDefaults = (data.companies || [createInitialCompany(1, '会社1')]).map(company => ({
                             ...company,
@@ -710,6 +719,7 @@
                     const data = {
                         year,
                         month,
+                        settings,
                         companies,
                         selectedCompanyId,
                         showGroupView,
@@ -719,14 +729,14 @@
                 } catch (e) {
                     console.error('Failed to save to localStorage', e);
                 }
-            }, [year, month, companies, selectedCompanyId, showGroupView, nextId]);
+            }, [year, month, settings, companies, selectedCompanyId, showGroupView, nextId]);
 
             // 選択中の会社を取得
             const selectedCompany = companies.find(c => c.id === selectedCompanyId) || companies[0];
 
             // 会社追加
             const addCompany = () => {
-                const newCompany = createInitialCompany(nextId, `会社${nextId}`);
+                const newCompany = createInitialCompany(nextId, `会社${nextId}`, settings);
                 setCompanies([...companies, newCompany]);
                 setSelectedCompanyId(nextId);
                 setNextId(nextId + 1);
@@ -771,8 +781,7 @@
                 }
             };
 
-            // グループ合算KPI
-            const groupKPI = calculateGroupTotal(companies, year, month);
+            const groupKPI = calculateGroupTotal(companies, year, month, settings);
 
             return (
                 <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
@@ -843,6 +852,14 @@
                                         新規グループ
                                     </button>
 
+                                    {/* 設定 */}
+                                    <button
+                                        onClick={() => setShowSettingsModal(true)}
+                                        className="px-4 py-2 bg-slate-600 hover:bg-slate-700 rounded-lg font-semibold shadow-md transition-colors"
+                                    >
+                                        ⚙️ 設定
+                                    </button>
+
                                     {/* リセット */}
                                     <button
                                         onClick={resetAll}
@@ -855,6 +872,65 @@
                         </div>
                     </header>
 
+                    {/* 設定モーダル */}
+                    {showSettingsModal && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setShowSettingsModal(false)}>
+                            <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6" onClick={(e) => e.stopPropagation()}>
+                                <h2 className="text-xl font-bold text-slate-800 mb-4">⚙️ 機能設定</h2>
+                                <div className="space-y-4">
+                                    <div>
+                                        <label className="block text-sm font-medium text-slate-700 mb-1">消費税率（%）</label>
+                                        <input
+                                            type="number"
+                                            value={settings.consumptionTaxRate ?? 10}
+                                            onChange={(e) => setSettings(s => ({ ...s, consumptionTaxRate: Number(e.target.value) || 10 }))}
+                                            className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500"
+                                            min="0"
+                                            max="100"
+                                            step="0.1"
+                                        />
+                                        <p className="text-xs text-slate-500 mt-1">※標準税率10%、軽減税率8%など</p>
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-slate-700 mb-1">新規会社のデフォルト社保料率（%）</label>
+                                        <input
+                                            type="number"
+                                            value={settings.defaultSocialInsuranceRate ?? 15}
+                                            onChange={(e) => setSettings(s => ({ ...s, defaultSocialInsuranceRate: Number(e.target.value) || 15 }))}
+                                            className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500"
+                                            min="0"
+                                            max="100"
+                                            step="0.1"
+                                        />
+                                    </div>
+                                    <label className="flex items-center gap-2">
+                                        <input
+                                            type="checkbox"
+                                            checked={settings.showIntermediateTaxSection ?? true}
+                                            onChange={(e) => setSettings(s => ({ ...s, showIntermediateTaxSection: e.target.checked }))}
+                                            className="rounded"
+                                        />
+                                        <span className="text-sm text-slate-700">中間申告セクションを表示</span>
+                                    </label>
+                                    <label className="flex items-center gap-2">
+                                        <input
+                                            type="checkbox"
+                                            checked={settings.showMonthlyCFSection ?? true}
+                                            onChange={(e) => setSettings(s => ({ ...s, showMonthlyCFSection: e.target.checked }))}
+                                            className="rounded"
+                                        />
+                                        <span className="text-sm text-slate-700">月次キャッシュフローセクションを表示</span>
+                                    </label>
+                                </div>
+                                <div className="mt-6 flex justify-end">
+                                    <button onClick={() => setShowSettingsModal(false)} className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700">
+                                        閉じる
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {/* メインコンテンツ */}
                     <div className="container mx-auto px-4 py-8">
                         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -865,7 +941,7 @@
                                     <h2 className="text-xl font-bold text-slate-800 mb-4 border-b pb-2">会社リスト</h2>
                                     <div className="space-y-3 custom-scrollbar max-h-[calc(100vh-250px)] overflow-y-auto">
                                         {companies.map(company => {
-                                            const kpi = calculateKPI(company, year, month);
+                                            const kpi = calculateKPI(company, year, month, settings);
                                             const isSelected = company.id === selectedCompanyId;
                                             
                                             return (
@@ -1050,6 +1126,8 @@
                                             </div>
                                         </div>
 
+                                        {settings.showIntermediateTaxSection !== false && (
+                                        <>
                                         {/* 中間消費税申告（入力） */}
                                         <div className="bg-violet-50 p-4 rounded-lg border border-violet-200">
                                             <h3 className="font-semibold text-slate-700 mb-3">中間消費税申告</h3>
@@ -1120,6 +1198,8 @@
                                                 </div>
                                             </div>
                                         </div>
+                                        </>
+                                        )}
 
                                         {/* 数値入力 */}
                                         <div className="space-y-4">
@@ -1647,11 +1727,12 @@
                                                 </div>
                                             </div>
 
-                                            {/* ⑥ グループ合算 月次CFテーブル・グラフ */}
-                                            <div className="space-y-4 mt-4">
-                                                <MonthlyCFTable data={calculateGroupMonthlyCF(companies, year)} year={year} isGroup />
-                                                <CashFlowChart data={calculateGroupMonthlyCF(companies, year)} year={year} isGroup />
-                                            </div>
+                                            {settings.showMonthlyCFSection !== false && (
+                                                <div className="space-y-4 mt-4">
+                                                    <MonthlyCFTable data={calculateGroupMonthlyCF(companies, year, settings)} year={year} isGroup />
+                                                    <CashFlowChart data={calculateGroupMonthlyCF(companies, year, settings)} year={year} isGroup />
+                                                </div>
+                                            )}
                                         </div>
                                     )}
 
@@ -1662,7 +1743,7 @@
                                         </h2>
                                         <div className="space-y-3">
                                             {(() => {
-                                                const kpi = calculateKPI(selectedCompany, year, month);
+                                                const kpi = calculateKPI(selectedCompany, year, month, settings);
                                                 return (
                                                     <>
                                                         <div className="bg-blue-50 rounded-lg p-3 border-2 border-blue-200">
@@ -1703,6 +1784,8 @@
                                                             <div className="text-xs text-slate-500 mt-1">税込売上ベースで計算</div>
                                                         </div>
 
+                                                        {settings.showIntermediateTaxSection !== false && (
+                                                        <>
                                                         {/* 中間消費税申告（出力） */}
                                                         {(() => {
                                                             const interim = calculateInterimConsumptionTax(selectedCompany, year);
@@ -1770,12 +1853,15 @@
                                                                 </div>
                                                             );
                                                         })()}
+                                                        </>
+                                                        )}
 
-                                                        {/* ⑤ 個社 月次CFテーブル・グラフ */}
+                                                        {settings.showMonthlyCFSection !== false && (
                                                         <div className="space-y-4 mt-4">
-                                                            <MonthlyCFTable data={calculateMonthlyCashFlow(selectedCompany, year)} year={year} />
-                                                            <CashFlowChart data={calculateMonthlyCashFlow(selectedCompany, year)} year={year} />
+                                                            <MonthlyCFTable data={calculateMonthlyCashFlow(selectedCompany, year, settings)} year={year} />
+                                                            <CashFlowChart data={calculateMonthlyCashFlow(selectedCompany, year, settings)} year={year} />
                                                         </div>
+                                                        )}
                                                     </>
                                                 );
                                             })()}
