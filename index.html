@@ -535,6 +535,31 @@
             return 0;
         };
 
+        // 労働保険年度更新を月別出金として取得 { month: 1-12, amount }[]
+        const getLaborInsuranceOutflowsByMonth = (company, year) => {
+            const startMonth = company.taxPeriodStartMonth || 4;
+            const lab = calculateLaborInsurance(company, year);
+            const out = [];
+            if (lab.installments && lab.installments.length) {
+                lab.installments.forEach(inst => {
+                    const match = (inst.dueDate || '').match(/(\d{4})年(\d{1,2})月/);
+                    if (match) {
+                        const dueYear = parseInt(match[1], 10);
+                        const dueMonth = parseInt(match[2], 10);
+                        const fm = calendarToFiscalMonth(dueYear, dueMonth, year, startMonth);
+                        if (fm >= 1 && fm <= 12 && (inst.amount || 0) > 0) out.push({ month: fm, amount: inst.amount });
+                    }
+                });
+            } else {
+                const amt = Math.max(0, lab.annualUpdateTotal || 0);
+                if (amt > 0) {
+                    const fm = calendarToFiscalMonth(year, 7, year, startMonth);
+                    if (fm >= 1 && fm <= 12) out.push({ month: fm, amount: amt });
+                }
+            }
+            return out;
+        };
+
         // 中間消費税・法人税中間申告を月別出金として取得 { items: {month, amount, type}[], totalCorp, totalCons }
         const getInterimTaxOutflowsByMonth = (company, year) => {
             const startMonth = company.taxPeriodStartMonth || 4;
@@ -607,6 +632,7 @@
             const { items: interimTaxItems, totalCorp: totalInterimCorp, totalCons: totalInterimCons } = getInterimTaxOutflowsByMonth(company, year);
             const finalCorporateTaxAmount = Math.max(0, corporateTax - totalInterimCorp);
             const finalConsumptionTaxAmount = Math.max(0, consumptionTax - totalInterimCons);
+            const laborInsuranceItems = getLaborInsuranceOutflowsByMonth(company, year);
 
             const result = [];
             let balance = beginningCash;
@@ -617,19 +643,29 @@
                 const receivablesInflow = (m === 1 ? receivablesDay0 : m === 2 ? receivablesDay30 : m === 3 ? receivablesDay60 : m === 4 ? receivablesDay90 : 0);
                 const inflow = salesInflow + receivablesInflow;
 
-                // 出金: 販管費＋給与をサイト分ずらし＋法人税・消費税（中間は当該月、確定は中間控除後の最終納付額）
+                // 出金: 販管費＋給与＋法人税・消費税（確定＋中間）＋労働保険料
                 const expenseOut = (m - expenseOffset >= 1) ? monthlyExpense : 0;
                 const laborOut = (m - salaryOffset >= 1) ? monthlyLabor : 0;
                 const finalCorporateTax = m === corporateTaxMonth ? finalCorporateTaxAmount : 0;
                 const finalConsumptionTax = m === consumptionTaxMonth ? finalConsumptionTaxAmount : 0;
                 const interimOut = interimTaxItems.filter(t => t.month === m).reduce((s, t) => s + t.amount, 0);
-                const taxOut = finalCorporateTax + finalConsumptionTax + interimOut;
+                const laborInsuranceOut = laborInsuranceItems.filter(t => t.month === m).reduce((s, t) => s + t.amount, 0);
+                const taxOut = finalCorporateTax + finalConsumptionTax + interimOut + laborInsuranceOut;
 
                 const outflow = expenseOut + laborOut + taxOut;
                 const netCF = inflow - outflow;
                 balance += netCF;
 
-                result.push({ month: m, inflow, outflow, netCF, balance });
+                result.push({
+                    month: m,
+                    inflow,
+                    outflow,
+                    netCF,
+                    balance,
+                    consumptionTaxOut: finalConsumptionTax + interimTaxItems.filter(t => t.month === m && t.type === 'cons').reduce((s, t) => s + t.amount, 0),
+                    corporateTaxOut: finalCorporateTax + interimTaxItems.filter(t => t.month === m && t.type === 'corp').reduce((s, t) => s + t.amount, 0),
+                    laborInsuranceOut
+                });
             }
             return result;
         };
@@ -643,14 +679,20 @@
             let balance = groupBeginningCash;
 
             for (let m = 1; m <= 12; m++) {
-                let inflow = 0, outflow = 0;
+                let inflow = 0, outflow = 0, consumptionTaxOut = 0, corporateTaxOut = 0, laborInsuranceOut = 0;
                 monthlyData.forEach(data => {
                     const row = data.find(r => r.month === m);
-                    if (row) { inflow += row.inflow; outflow += row.outflow; }
+                    if (row) {
+                        inflow += row.inflow;
+                        outflow += row.outflow;
+                        consumptionTaxOut += row.consumptionTaxOut || 0;
+                        corporateTaxOut += row.corporateTaxOut || 0;
+                        laborInsuranceOut += row.laborInsuranceOut || 0;
+                    }
                 });
                 const netCF = inflow - outflow;
                 balance += netCF;
-                result.push({ month: m, inflow, outflow, netCF, balance });
+                result.push({ month: m, inflow, outflow, consumptionTaxOut, corporateTaxOut, laborInsuranceOut, netCF, balance });
             }
             return result;
         };
@@ -704,19 +746,28 @@
             return formatCurrency(value);
         };
 
-        // ⑤ 月次CFテーブル（月/入金/出金/netCF/現金残高）
-        const MonthlyCFTable = ({ data, year, isGroup = false }) => (
+        // ⑤ 月次CFテーブル（月/入金/出金/消費税/法人税/労働保険料/netCF/現金残高）
+        const MonthlyCFTable = ({ data, year, isGroup = false }) => {
+            const hasBreakdown = data.some(r => (r.consumptionTaxOut || r.corporateTaxOut || r.laborInsuranceOut) !== undefined);
+            return (
             <div className={`rounded-lg shadow-md overflow-hidden ${isGroup ? 'bg-white/10 backdrop-blur text-white' : 'bg-white'}`}>
                 <h3 className={`font-bold p-3 ${isGroup ? 'text-white' : 'text-slate-800'}`}>
                     📅 {year}年度 月次キャッシュフロー
                 </h3>
-                <div className="overflow-x-auto max-h-64 overflow-y-auto">
+                <div className="overflow-x-auto max-h-80 overflow-y-auto">
                     <table className="w-full text-sm">
                         <thead>
                             <tr className={`${isGroup ? 'bg-white/20' : 'bg-slate-100'}`}>
                                 <th className="px-2 py-2 text-left font-semibold">月</th>
                                 <th className="px-2 py-2 text-right font-semibold">入金</th>
                                 <th className="px-2 py-2 text-right font-semibold">出金</th>
+                                {hasBreakdown && (
+                                    <>
+                                        <th className="px-1 py-2 text-right font-semibold text-xs">消費税</th>
+                                        <th className="px-1 py-2 text-right font-semibold text-xs">法人税</th>
+                                        <th className="px-1 py-2 text-right font-semibold text-xs">労働保険</th>
+                                    </>
+                                )}
                                 <th className="px-2 py-2 text-right font-semibold">netCF</th>
                                 <th className="px-2 py-2 text-right font-semibold">現金残高</th>
                             </tr>
@@ -727,6 +778,13 @@
                                     <td className="px-2 py-2 font-medium">{row.month}月</td>
                                     <td className="px-2 py-2 text-right">{formatCurrency(row.inflow)}円</td>
                                     <td className="px-2 py-2 text-right">{formatCurrency(row.outflow)}円</td>
+                                    {hasBreakdown && (
+                                        <>
+                                            <td className="px-1 py-2 text-right text-xs">{(row.consumptionTaxOut || 0) ? formatCurrency(row.consumptionTaxOut) + '円' : '-'}</td>
+                                            <td className="px-1 py-2 text-right text-xs">{(row.corporateTaxOut || 0) ? formatCurrency(row.corporateTaxOut) + '円' : '-'}</td>
+                                            <td className="px-1 py-2 text-right text-xs">{(row.laborInsuranceOut || 0) ? formatCurrency(row.laborInsuranceOut) + '円' : '-'}</td>
+                                        </>
+                                    )}
                                     <td className={`px-2 py-2 text-right font-semibold ${row.netCF >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                                         {row.netCF >= 0 ? '+' : ''}{formatCurrency(row.netCF)}円
                                     </td>
@@ -739,7 +797,8 @@
                     </table>
                 </div>
             </div>
-        );
+            );
+        };
 
         // ⑤ 現金残高折れ線グラフ（簡易SVG・外部ライブラリなし）
         const CashFlowChart = ({ data, year, isGroup = false }) => {
