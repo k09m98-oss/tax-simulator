@@ -1,0 +1,1546 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>経営用キャッシュフローツール</title>
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM CDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel Standalone for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <style>
+        body {
+            font-family: 'Segoe UI', 'Hiragino Sans', 'Yu Gothic', sans-serif;
+        }
+        
+        /* カスタムスクロールバー */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f5f9;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        // ローカルストレージキー
+        const STORAGE_KEY = 'tax_simulator_data_v2'; // v2: 月次CF・期首現金・サイト追加
+
+        // 初期会社データ
+        const createInitialCompany = (id, name) => ({
+            id,
+            name,
+            isTaxable: true, // 課税事業者
+            hasInvoice: true, // インボイス登録あり
+            revenue: 0, // 売上（税抜）
+            
+            // 役員報酬
+            executiveCompensation: 0,
+            executiveCompensationInputMode: 'manual',
+            executiveCompensationPercent: 10,
+            
+            // 給与
+            salary: 0,
+            salaryInputMode: 'manual',
+            salaryPercent: 15,
+            
+            // 外注費（インボイスあり）
+            outsourcingWithInvoice: 0,
+            outsourcingWithInvoiceInputMode: 'manual',
+            outsourcingWithInvoicePercent: 5,
+            
+            // 外注費（インボイスなし）
+            outsourcingWithoutInvoice: 0,
+            outsourcingWithoutInvoiceInputMode: 'manual',
+            outsourcingWithoutInvoicePercent: 0,
+            
+            // 販管費（インボイスあり）
+            expenseWithInvoice: 0,
+            expenseWithInvoiceInputMode: 'manual',
+            expenseWithInvoicePercent: 20,
+            
+            // 販管費（インボイスなし）
+            expenseWithoutInvoice: 0,
+            expenseWithoutInvoiceInputMode: 'manual',
+            expenseWithoutInvoicePercent: 5,
+            
+            // 社会保険（役員報酬・給与それぞれに対して計算）
+            includeSocialInsurance: true,
+            executiveSocialInsurancePercent: 15,
+            salarySocialInsurancePercent: 15,
+
+            // ① 期首現金（年初残高）
+            beginningCash: 0,
+
+            // ② 支払いサイト（月次CF用）
+            salesPaymentDays: 0,      // A) 売上: 0/30/60/90日
+            expensePaymentDays: 0,    // B) 販管費: 0/30/60/90日
+            salaryPaymentTerms: 'current', // C) 給与: 'current'=当月末 / 'next'=翌月末
+
+            // ③ 税金の支払月（1〜12）
+            corporateTaxMonth: 3,
+            consumptionTaxMonth: 3
+        });
+
+        // 免税事業者等からの仕入れにおける経過措置の控除率を取得
+        // 図表1「免税事業者等からの仕入れにおける経過措置」に基づく（年月で判定）
+        // 2023/10/1～2026/9/30: 80% | 2026/10/1～2029/9/30: 50% | 2029/10/1～: 控除不可
+        const getTaxExemptDeductionRate = (year, month) => {
+            const dateValue = year * 100 + (month || 1);
+            if (dateValue < 202610) return 0.8;   // 2026年10月未満: 80%
+            if (dateValue < 202910) return 0.5;   // 2029年10月未満: 50%
+            return 0;                              // それ以降: 控除不可
+        };
+
+        // 計算関数
+        const calculateKPI = (company, year, month) => {
+            const { revenue, isTaxable, includeSocialInsurance,
+                    // 役員報酬
+                    executiveCompensation, executiveCompensationInputMode, executiveCompensationPercent,
+                    // 給与
+                    salary, salaryInputMode, salaryPercent,
+                    // 外注費
+                    outsourcingWithInvoice, outsourcingWithInvoiceInputMode, outsourcingWithInvoicePercent,
+                    outsourcingWithoutInvoice, outsourcingWithoutInvoiceInputMode, outsourcingWithoutInvoicePercent,
+                    // 販管費
+                    expenseWithInvoice, expenseWithInvoiceInputMode, expenseWithInvoicePercent,
+                    expenseWithoutInvoice, expenseWithoutInvoiceInputMode, expenseWithoutInvoicePercent,
+                    // 社保料率
+                    executiveSocialInsurancePercent, salarySocialInsurancePercent } = company;
+
+            // 実際の金額を計算（パーセント入力の場合は売上から計算）
+            const actualExecutiveCompensation = executiveCompensationInputMode === 'percent' 
+                ? revenue * (executiveCompensationPercent / 100)
+                : executiveCompensation;
+            
+            const actualSalary = salaryInputMode === 'percent'
+                ? revenue * (salaryPercent / 100)
+                : salary;
+            
+            const actualOutsourcingWithInvoice = outsourcingWithInvoiceInputMode === 'percent'
+                ? revenue * (outsourcingWithInvoicePercent / 100)
+                : outsourcingWithInvoice;
+            
+            const actualOutsourcingWithoutInvoice = outsourcingWithoutInvoiceInputMode === 'percent'
+                ? revenue * (outsourcingWithoutInvoicePercent / 100)
+                : outsourcingWithoutInvoice;
+            
+            const actualExpenseWithInvoice = expenseWithInvoiceInputMode === 'percent'
+                ? revenue * (expenseWithInvoicePercent / 100)
+                : expenseWithInvoice;
+            
+            const actualExpenseWithoutInvoice = expenseWithoutInvoiceInputMode === 'percent'
+                ? revenue * (expenseWithoutInvoicePercent / 100)
+                : expenseWithoutInvoice;
+
+            // 社会保険料の計算（役員報酬と給与それぞれに対して）
+            const executiveSocialInsuranceCost = actualExecutiveCompensation * (executiveSocialInsurancePercent / 100);
+            const salarySocialInsuranceCost = actualSalary * (salarySocialInsurancePercent / 100);
+            const totalSocialInsuranceCost = executiveSocialInsuranceCost + salarySocialInsuranceCost;
+
+            // 人件費合計（役員報酬 + 給与 + 外注費）
+            const totalLaborCost = actualExecutiveCompensation + actualSalary + actualOutsourcingWithInvoice + actualOutsourcingWithoutInvoice;
+
+            // ============================================================
+            // 損益計算（税抜ベース）
+            // ============================================================
+            
+            // ① 営業利益（税抜ベース）
+            const operatingProfit = revenue - totalLaborCost - (actualExpenseWithInvoice + actualExpenseWithoutInvoice);
+
+            // ② 法人税等の計算（中小企業者向け）
+            // 年間課税所得 = 営業利益
+            const taxableIncome = Math.max(0, operatingProfit);
+            
+            let nationalCorporateTax = 0; // 法人税
+            let localCorporateTax = 0; // 地方法人税
+            let businessTax = 0; // 法人事業税
+            let specialBusinessTax = 0; // 特別法人事業税
+            let residentTax = 0; // 法人住民税
+            
+            if (taxableIncome > 0) {
+                // 中小企業者の法人税率（資本金1億円以下）
+                // 課税所得800万円以下: 15.0%
+                // 課税所得800万円超: 23.2%
+                
+                const threshold = 8000000; // 800万円
+                
+                if (taxableIncome <= threshold) {
+                    // 800万円以下の部分
+                    nationalCorporateTax = taxableIncome * 0.15;
+                } else {
+                    // 800万円以下の部分 + 800万円超の部分
+                    nationalCorporateTax = (threshold * 0.15) + ((taxableIncome - threshold) * 0.232);
+                }
+                
+                // 地方法人税（法人税額の10.3%）
+                localCorporateTax = nationalCorporateTax * 0.103;
+                
+                // 法人事業税（中小企業者）
+                const bt_threshold1 = 4000000; // 400万円
+                const bt_threshold2 = 8000000; // 800万円
+                
+                if (taxableIncome <= bt_threshold1) {
+                    businessTax = taxableIncome * 0.035;
+                } else if (taxableIncome <= bt_threshold2) {
+                    businessTax = (bt_threshold1 * 0.035) + ((taxableIncome - bt_threshold1) * 0.053);
+                } else {
+                    businessTax = (bt_threshold1 * 0.035) + ((bt_threshold2 - bt_threshold1) * 0.053) + ((taxableIncome - bt_threshold2) * 0.07);
+                }
+                
+                // 特別法人事業税（法人事業税額の37.0%）
+                specialBusinessTax = businessTax * 0.37;
+                
+                // 法人住民税（所得割：法人税額の7.0% + 均等割：70,000円）
+                residentTax = (nationalCorporateTax * 0.07) + 70000;
+            }
+            
+            // 法人税等合計
+            const corporateTax = nationalCorporateTax + localCorporateTax + businessTax + specialBusinessTax + residentTax;
+
+            // ③ 税引後利益（税抜ベース）
+            const netProfit = operatingProfit - corporateTax;
+
+            // ============================================================
+            // 消費税計算
+            // ============================================================
+            
+            // 預かり消費税（売上×10%）
+            const receivedConsumptionTax = revenue * 0.1;
+            
+            // 支払消費税（仕入控除：販管費＋外注費）
+            // ※人件費（役員報酬・給与）は消費税の対象外
+            // ※免税事業者等からの仕入れは経過措置に基づき一部控除可能（図表1参照）
+            const taxExemptDeductionRate = getTaxExemptDeductionRate(year, month);
+            const paidConsumptionTax = (actualExpenseWithInvoice * 0.1) + (actualOutsourcingWithInvoice * 0.1)
+                + (actualExpenseWithoutInvoice * 0.1 * taxExemptDeductionRate)
+                + (actualOutsourcingWithoutInvoice * 0.1 * taxExemptDeductionRate);
+            
+            // 消費税納付額 = 預かり消費税 - 支払消費税
+            const consumptionTax = isTaxable 
+                ? receivedConsumptionTax - paidConsumptionTax
+                : 0;
+
+            // ============================================================
+            // キャッシュフロー計算（税込ベース）
+            // ============================================================
+            
+            // 【キャッシュイン】
+            // 税込売上（実際の入金額）
+            const taxIncludedRevenue = revenue * 1.1;
+            
+            // 【キャッシュアウト】
+            // 1. 人件費（非課税なのでそのまま）
+            const cashOutLabor = totalLaborCost;
+            
+            // 2. 販管費（税込）
+            const cashOutExpense = (actualExpenseWithInvoice + actualExpenseWithoutInvoice) * 1.1;
+            
+            // 3. 外注費（税込）
+            const cashOutOutsourcing = (actualOutsourcingWithInvoice + actualOutsourcingWithoutInvoice) * 1.1;
+            
+            // 4. 法人税
+            const cashOutCorporateTax = corporateTax;
+            
+            // 5. 消費税納付額
+            const cashOutConsumptionTax = consumptionTax;
+            
+            // 6. 社会保険料（別表示の場合のみ）
+            const socialInsuranceDeduction = includeSocialInsurance ? 0 : totalSocialInsuranceCost;
+            const cashOutSocialInsurance = socialInsuranceDeduction;
+            
+            // 実質キャッシュ残高
+            // = 税込売上 - 人件費 - 販管費（税込） - 外注費（税込） - 法人税 - 消費税納付 - 社保
+            const actualCash = taxIncludedRevenue 
+                - cashOutLabor 
+                - cashOutExpense 
+                - cashOutOutsourcing 
+                - cashOutCorporateTax 
+                - cashOutConsumptionTax 
+                - cashOutSocialInsurance;
+
+            return {
+                // 損益計算（税抜ベース）
+                operatingProfit,
+                taxableIncome, // 課税所得
+                corporateTax, // 法人税等合計
+                nationalCorporateTax, // 法人税
+                localCorporateTax, // 地方法人税
+                businessTax, // 法人事業税
+                specialBusinessTax, // 特別法人事業税
+                residentTax, // 法人住民税
+                netProfit,
+                
+                // 消費税関連
+                consumptionTax,
+                receivedConsumptionTax, // 預かり消費税
+                paidConsumptionTax, // 支払消費税
+                
+                // キャッシュフロー
+                taxIncludedRevenue, // 税込売上
+                actualCash, // 実質キャッシュ残高
+                
+                // 詳細情報
+                actualExecutiveCompensation,
+                actualSalary,
+                actualOutsourcingWithInvoice,
+                actualOutsourcingWithoutInvoice,
+                totalLaborCost,
+                executiveSocialInsuranceCost,
+                salarySocialInsuranceCost,
+                totalSocialInsuranceCost,
+                actualExpenseWithInvoice,
+                actualExpenseWithoutInvoice
+            };
+        };
+
+        // ============================================================
+        // ④ 月次キャッシュフロー計算（サイト考慮）
+        // ============================================================
+        // サイト: 0日=当月, 30日=翌月, 60日=2ヶ月後, 90日=3ヶ月後
+        const getMonthOffset = (days) => Math.floor((days || 0) / 30);
+
+        const calculateMonthlyCashFlow = (company, year) => {
+            const kpi = calculateKPI(company, year, 1); // 1月基準で税額算出
+            const {
+                taxIncludedRevenue,
+                corporateTax,
+                consumptionTax,
+                actualExecutiveCompensation,
+                actualSalary,
+                totalSocialInsuranceCost,
+                actualExpenseWithInvoice,
+                actualExpenseWithoutInvoice,
+                actualOutsourcingWithInvoice,
+                actualOutsourcingWithoutInvoice
+            } = kpi;
+
+            const beginningCash = company.beginningCash || 0;
+            const salesOffset = getMonthOffset(company.salesPaymentDays || 0);
+            const expenseOffset = getMonthOffset(company.expensePaymentDays || 0);
+            const salaryOffset = company.salaryPaymentTerms === 'next' ? 1 : 0;
+            const corporateTaxMonth = company.corporateTaxMonth || 3;
+            const consumptionTaxMonth = company.consumptionTaxMonth || 3;
+
+            // 月額（年額÷12）。販管費=外注費+その他販管費、給与=役員報酬+給与+社保
+            const monthlySales = taxIncludedRevenue / 12;
+            const monthlyExpense = (actualExpenseWithInvoice + actualExpenseWithoutInvoice
+                + actualOutsourcingWithInvoice + actualOutsourcingWithoutInvoice) * 1.1 / 12;
+            const monthlyLabor = (actualExecutiveCompensation + actualSalary
+                + (company.includeSocialInsurance ? totalSocialInsuranceCost : 0)) / 12;
+
+            const result = [];
+            let balance = beginningCash;
+
+            for (let m = 1; m <= 12; m++) {
+                // 入金: 売上をサイト分ずらして計上
+                const inflow = (m - salesOffset >= 1) ? monthlySales : 0;
+
+                // 出金: 販管費＋給与をサイト分ずらし＋税金（該当月のみ）
+                const expenseOut = (m - expenseOffset >= 1) ? monthlyExpense : 0;
+                const laborOut = (m - salaryOffset >= 1) ? monthlyLabor : 0;
+                const taxOut = (m === corporateTaxMonth ? corporateTax : 0) + (m === consumptionTaxMonth ? consumptionTax : 0);
+
+                const outflow = expenseOut + laborOut + taxOut;
+                const netCF = inflow - outflow;
+                balance += netCF;
+
+                result.push({ month: m, inflow, outflow, netCF, balance });
+            }
+            return result;
+        };
+
+        // ⑥ グループ合算CF（全社の月次を単純合算）
+        const calculateGroupMonthlyCF = (companies, year) => {
+            const monthlyData = companies.map(c => calculateMonthlyCashFlow(c, year));
+            const result = [];
+            const groupBeginningCash = companies.reduce((sum, c) => sum + (c.beginningCash || 0), 0);
+            let balance = groupBeginningCash;
+
+            for (let m = 1; m <= 12; m++) {
+                let inflow = 0, outflow = 0;
+                monthlyData.forEach(data => {
+                    const row = data.find(r => r.month === m);
+                    if (row) { inflow += row.inflow; outflow += row.outflow; }
+                });
+                const netCF = inflow - outflow;
+                balance += netCF;
+                result.push({ month: m, inflow, outflow, netCF, balance });
+            }
+            return result;
+        };
+
+        // グループ合算計算（従来KPI用）
+        const calculateGroupTotal = (companies, year, month) => {
+            const totals = {
+                operatingProfit: 0,
+                consumptionTax: 0,
+                receivedConsumptionTax: 0,
+                paidConsumptionTax: 0,
+                corporateTax: 0,
+                netProfit: 0,
+                taxIncludedRevenue: 0,
+                actualCash: 0,
+                totalSocialInsuranceCost: 0
+            };
+
+            companies.forEach(company => {
+                const kpi = calculateKPI(company, year, month);
+                totals.operatingProfit += kpi.operatingProfit;
+                totals.consumptionTax += kpi.consumptionTax;
+                totals.receivedConsumptionTax += kpi.receivedConsumptionTax;
+                totals.paidConsumptionTax += kpi.paidConsumptionTax;
+                totals.corporateTax += kpi.corporateTax;
+                totals.netProfit += kpi.netProfit;
+                totals.taxIncludedRevenue += kpi.taxIncludedRevenue;
+                totals.actualCash += kpi.actualCash;
+                totals.totalSocialInsuranceCost += kpi.totalSocialInsuranceCost;
+            });
+
+            return totals;
+        };
+
+        // 数値フォーマット（カンマ区切り）
+        const formatCurrency = (value) => {
+            return new Intl.NumberFormat('ja-JP').format(Math.round(value));
+        };
+
+        // 入力値からカンマを除去して数値化
+        const parseNumber = (value) => {
+            if (typeof value === 'number') return value;
+            if (!value) return 0;
+            const cleaned = String(value).replace(/,/g, '');
+            return Number(cleaned) || 0;
+        };
+
+        // 数値入力フィールド用のフォーマット（カンマ付き表示）
+        const formatInputValue = (value) => {
+            if (!value && value !== 0) return '';
+            return formatCurrency(value);
+        };
+
+        // ⑤ 月次CFテーブル（月/入金/出金/netCF/現金残高）
+        const MonthlyCFTable = ({ data, year, isGroup = false }) => (
+            <div className={`rounded-lg shadow-md overflow-hidden ${isGroup ? 'bg-white/10 backdrop-blur text-white' : 'bg-white'}`}>
+                <h3 className={`font-bold p-3 ${isGroup ? 'text-white' : 'text-slate-800'}`}>
+                    📅 {year}年度 月次キャッシュフロー
+                </h3>
+                <div className="overflow-x-auto max-h-64 overflow-y-auto">
+                    <table className="w-full text-sm">
+                        <thead>
+                            <tr className={`${isGroup ? 'bg-white/20' : 'bg-slate-100'}`}>
+                                <th className="px-2 py-2 text-left font-semibold">月</th>
+                                <th className="px-2 py-2 text-right font-semibold">入金</th>
+                                <th className="px-2 py-2 text-right font-semibold">出金</th>
+                                <th className="px-2 py-2 text-right font-semibold">netCF</th>
+                                <th className="px-2 py-2 text-right font-semibold">現金残高</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {data.map((row, i) => (
+                                <tr key={i} className={`border-t ${isGroup ? 'border-white/20' : 'border-slate-200'}`}>
+                                    <td className="px-2 py-2 font-medium">{row.month}月</td>
+                                    <td className="px-2 py-2 text-right">{formatCurrency(row.inflow)}円</td>
+                                    <td className="px-2 py-2 text-right">{formatCurrency(row.outflow)}円</td>
+                                    <td className={`px-2 py-2 text-right font-semibold ${row.netCF >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                        {row.netCF >= 0 ? '+' : ''}{formatCurrency(row.netCF)}円
+                                    </td>
+                                    <td className={`px-2 py-2 text-right font-bold ${row.balance >= 0 ? (isGroup ? 'text-green-300' : 'text-green-600') : (isGroup ? 'text-red-300' : 'text-red-600')}`}>
+                                        {formatCurrency(row.balance)}円
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        );
+
+        // ⑤ 現金残高折れ線グラフ（簡易SVG・外部ライブラリなし）
+        const CashFlowChart = ({ data, year, isGroup = false }) => {
+            const values = data.map(d => d.balance);
+            const min = Math.min(0, ...values);
+            const max = Math.max(0, ...values);
+            const range = max - min || 1;
+            const h = 120, w = 100;
+            const pts = values.map((v, i) => {
+                const x = (i / 11) * (w - 20) + 10;
+                const y = h - 20 - ((v - min) / range) * (h - 40);
+                return `${x},${y}`;
+            }).join(' ');
+            const lineColor = isGroup ? '#93c5fd' : '#3b82f6';
+            const zeroColor = isGroup ? 'rgba(255,255,255,0.5)' : '#e2e8f0';
+            return (
+                <div className={`rounded-lg shadow-md p-4 ${isGroup ? 'bg-white/10 backdrop-blur text-white' : 'bg-white'}`}>
+                    <h3 className={`font-bold mb-2 ${isGroup ? 'text-white' : 'text-slate-800'}`}>📈 現金残高推移</h3>
+                    <svg viewBox={`0 0 ${w + 20} ${h + 30}`} className="w-full max-w-sm">
+                        <line x1="10" y1={h/2} x2={w+10} y2={h/2} stroke={zeroColor} strokeDasharray="2,2" />
+                        <polyline points={pts} fill="none" stroke={lineColor} strokeWidth="2" />
+                        {values.map((v, i) => (
+                            <circle key={i} cx={(i/11)*(w-20)+10} cy={h-20-((v-min)/range)*(h-40)} r="3" fill={v >= 0 ? (isGroup ? '#86efac' : '#22c55e') : (isGroup ? '#fca5a5' : '#ef4444')} />
+                        ))}
+                    </svg>
+                    <div className={`flex justify-between text-xs mt-1 ${isGroup ? 'text-white/80' : 'text-slate-500'}`}>
+                        <span>1月</span><span>12月</span>
+                    </div>
+                </div>
+            );
+        };
+
+        // KPIカードコンポーネント
+        const KPICard = ({ title, value, highlight = false, isGroup = false }) => {
+            const isPositive = value >= 0;
+            const colorClass = isPositive ? 'text-green-600' : 'text-red-600';
+            
+            return (
+                <div className={`bg-white rounded-lg shadow-md p-4 ${highlight ? 'ring-2 ring-blue-500' : ''}`}>
+                    <div className="text-sm text-slate-600 mb-1">{title}</div>
+                    <div className={`text-2xl font-bold ${colorClass} ${isGroup ? 'text-3xl' : ''}`}>
+                        {isPositive ? '+' : ''}{formatCurrency(value)}
+                        <span className="text-sm font-normal ml-1">円</span>
+                    </div>
+                </div>
+            );
+        };
+
+        // メインアプリコンポーネント
+        const App = () => {
+            // 状態管理
+            const [year, setYear] = useState(2025);
+            const [month, setMonth] = useState(1);
+            const [companies, setCompanies] = useState([createInitialCompany(1, '会社1')]);
+            const [selectedCompanyId, setSelectedCompanyId] = useState(1);
+            const [showGroupView, setShowGroupView] = useState(true);
+            const [nextId, setNextId] = useState(2);
+
+            // LocalStorage からデータ読み込み（v1からの移行対応）
+            useEffect(() => {
+                try {
+                    let saved = localStorage.getItem(STORAGE_KEY);
+                    if (!saved) saved = localStorage.getItem('tax_simulator_data_v1');
+                    if (saved) {
+                        const data = JSON.parse(saved);
+                        setYear(data.year || 2025);
+                        setMonth(data.month || 1);
+                        // 古いデータとの互換性のためデフォルト値を設定
+                        const companiesWithDefaults = (data.companies || [createInitialCompany(1, '会社1')]).map(company => ({
+                            ...company,
+                            // 役員報酬
+                            executiveCompensation: company.executiveCompensation || 0,
+                            executiveCompensationInputMode: company.executiveCompensationInputMode || 'manual',
+                            executiveCompensationPercent: company.executiveCompensationPercent || 10,
+                            // 給与
+                            salary: company.salary || 0,
+                            salaryInputMode: company.salaryInputMode || 'manual',
+                            salaryPercent: company.salaryPercent || 15,
+                            // 外注費（インボイスあり）
+                            outsourcingWithInvoice: company.outsourcingWithInvoice || 0,
+                            outsourcingWithInvoiceInputMode: company.outsourcingWithInvoiceInputMode || 'manual',
+                            outsourcingWithInvoicePercent: company.outsourcingWithInvoicePercent || 5,
+                            // 外注費（インボイスなし）
+                            outsourcingWithoutInvoice: company.outsourcingWithoutInvoice || 0,
+                            outsourcingWithoutInvoiceInputMode: company.outsourcingWithoutInvoiceInputMode || 'manual',
+                            outsourcingWithoutInvoicePercent: company.outsourcingWithoutInvoicePercent || 0,
+                            // 販管費（インボイスあり）
+                            expenseWithInvoiceInputMode: company.expenseWithInvoiceInputMode || 'manual',
+                            expenseWithInvoicePercent: company.expenseWithInvoicePercent || 20,
+                            // 販管費（インボイスなし）
+                            expenseWithoutInvoiceInputMode: company.expenseWithoutInvoiceInputMode || 'manual',
+                            expenseWithoutInvoicePercent: company.expenseWithoutInvoicePercent || 5,
+                            // 社保料率
+                            executiveSocialInsurancePercent: company.executiveSocialInsurancePercent || 15,
+                            salarySocialInsurancePercent: company.salarySocialInsurancePercent || 15,
+                            // 期首現金・サイト・税金支払月
+                            beginningCash: company.beginningCash ?? 0,
+                            salesPaymentDays: company.salesPaymentDays ?? 0,
+                            expensePaymentDays: company.expensePaymentDays ?? 0,
+                            salaryPaymentTerms: company.salaryPaymentTerms || 'current',
+                            corporateTaxMonth: company.corporateTaxMonth ?? 3,
+                            consumptionTaxMonth: company.consumptionTaxMonth ?? 3
+                        }));
+                        setCompanies(companiesWithDefaults);
+                        setSelectedCompanyId(data.selectedCompanyId || 1);
+                        setShowGroupView(data.showGroupView !== undefined ? data.showGroupView : true);
+                        setNextId(data.nextId || 2);
+                    }
+                } catch (e) {
+                    console.error('Failed to load from localStorage', e);
+                }
+            }, []);
+
+            // LocalStorage へデータ保存
+            useEffect(() => {
+                try {
+                    const data = {
+                        year,
+                        month,
+                        companies,
+                        selectedCompanyId,
+                        showGroupView,
+                        nextId
+                    };
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+                } catch (e) {
+                    console.error('Failed to save to localStorage', e);
+                }
+            }, [year, month, companies, selectedCompanyId, showGroupView, nextId]);
+
+            // 選択中の会社を取得
+            const selectedCompany = companies.find(c => c.id === selectedCompanyId) || companies[0];
+
+            // 会社追加
+            const addCompany = () => {
+                const newCompany = createInitialCompany(nextId, `会社${nextId}`);
+                setCompanies([...companies, newCompany]);
+                setSelectedCompanyId(nextId);
+                setNextId(nextId + 1);
+            };
+
+            // 会社削除（最低1社は残す）
+            const deleteCompany = (id) => {
+                if (companies.length <= 1) {
+                    alert('最低1社は必要です');
+                    return;
+                }
+                const newCompanies = companies.filter(c => c.id !== id);
+                setCompanies(newCompanies);
+                if (selectedCompanyId === id) {
+                    setSelectedCompanyId(newCompanies[0].id);
+                }
+            };
+
+            // 会社データ更新
+            const updateCompany = (id, updates) => {
+                setCompanies(companies.map(c => 
+                    c.id === id ? { ...c, ...updates } : c
+                ));
+            };
+
+            // リセット
+            const resetAll = () => {
+                if (confirm('すべてのデータをリセットしますか？')) {
+                    setCompanies([createInitialCompany(1, '会社1')]);
+                    setSelectedCompanyId(1);
+                    setNextId(2);
+                    setYear(2025);
+                    setMonth(1);
+                    setShowGroupView(true);
+                }
+            };
+
+            // 新規グループ作成
+            const createNewGroup = () => {
+                if (confirm('新規グループを作成しますか？（現在のデータは削除されます）')) {
+                    resetAll();
+                }
+            };
+
+            // グループ合算KPI
+            const groupKPI = calculateGroupTotal(companies, year, month);
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
+                    {/* ヘッダー */}
+                    <header className="bg-gradient-to-r from-blue-900 to-blue-800 text-white shadow-lg">
+                        <div className="container mx-auto px-4 py-6">
+                            <div className="flex flex-wrap items-center justify-between gap-4">
+                                <h1 className="text-2xl md:text-3xl font-bold">経営用キャッシュフローツール</h1>
+                                
+                                <div className="flex flex-wrap items-center gap-3">
+                                    {/* 年度・月選択 */}
+                                    <select 
+                                        value={year}
+                                        onChange={(e) => setYear(Number(e.target.value))}
+                                        className="px-4 py-2 rounded-lg bg-white text-slate-800 font-semibold shadow-md focus:outline-none focus:ring-2 focus:ring-blue-400"
+                                    >
+                                        <option value={2025}>2025年度</option>
+                                        <option value={2026}>2026年度</option>
+                                        <option value={2027}>2027年度</option>
+                                        <option value={2028}>2028年度</option>
+                                        <option value={2029}>2029年度</option>
+                                        <option value={2030}>2030年度</option>
+                                    </select>
+                                    <select 
+                                        value={month}
+                                        onChange={(e) => setMonth(Number(e.target.value))}
+                                        className="px-4 py-2 rounded-lg bg-white text-slate-800 font-semibold shadow-md focus:outline-none focus:ring-2 focus:ring-blue-400"
+                                    >
+                                        <option value={1}>1月</option>
+                                        <option value={2}>2月</option>
+                                        <option value={3}>3月</option>
+                                        <option value={4}>4月</option>
+                                        <option value={5}>5月</option>
+                                        <option value={6}>6月</option>
+                                        <option value={7}>7月</option>
+                                        <option value={8}>8月</option>
+                                        <option value={9}>9月</option>
+                                        <option value={10}>10月</option>
+                                        <option value={11}>11月</option>
+                                        <option value={12}>12月</option>
+                                    </select>
+
+                                    {/* グループビュートグル */}
+                                    <button
+                                        onClick={() => setShowGroupView(!showGroupView)}
+                                        className={`px-4 py-2 rounded-lg font-semibold shadow-md transition-colors ${
+                                            showGroupView 
+                                                ? 'bg-green-500 hover:bg-green-600' 
+                                                : 'bg-slate-300 hover:bg-slate-400 text-slate-700'
+                                        }`}
+                                    >
+                                        {showGroupView ? '✓ ' : ''}グループ合算
+                                    </button>
+
+                                    {/* 会社追加 */}
+                                    <button
+                                        onClick={addCompany}
+                                        className="px-4 py-2 bg-yellow-500 hover:bg-yellow-600 rounded-lg font-semibold shadow-md transition-colors"
+                                    >
+                                        + 会社追加
+                                    </button>
+
+                                    {/* 新規グループ */}
+                                    <button
+                                        onClick={createNewGroup}
+                                        className="px-4 py-2 bg-purple-500 hover:bg-purple-600 rounded-lg font-semibold shadow-md transition-colors"
+                                    >
+                                        新規グループ
+                                    </button>
+
+                                    {/* リセット */}
+                                    <button
+                                        onClick={resetAll}
+                                        className="px-4 py-2 bg-red-500 hover:bg-red-600 rounded-lg font-semibold shadow-md transition-colors"
+                                    >
+                                        リセット
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* メインコンテンツ */}
+                    <div className="container mx-auto px-4 py-8">
+                        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                            
+                            {/* 左カラム：会社リスト */}
+                            <div className="lg:col-span-3">
+                                <div className="bg-white rounded-lg shadow-lg p-4">
+                                    <h2 className="text-xl font-bold text-slate-800 mb-4 border-b pb-2">会社リスト</h2>
+                                    <div className="space-y-3 custom-scrollbar max-h-[calc(100vh-250px)] overflow-y-auto">
+                                        {companies.map(company => {
+                                            const kpi = calculateKPI(company, year, month);
+                                            const isSelected = company.id === selectedCompanyId;
+                                            
+                                            return (
+                                                <div
+                                                    key={company.id}
+                                                    className={`p-4 rounded-lg border-2 cursor-pointer transition-all ${
+                                                        isSelected 
+                                                            ? 'border-blue-500 bg-blue-50 shadow-md' 
+                                                            : 'border-slate-200 hover:border-blue-300 hover:shadow'
+                                                    }`}
+                                                    onClick={() => setSelectedCompanyId(company.id)}
+                                                >
+                                                    <div className="flex justify-between items-start mb-2">
+                                                        <h3 className="font-bold text-lg text-slate-800">{company.name}</h3>
+                                                        <button
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                deleteCompany(company.id);
+                                                            }}
+                                                            className="text-red-500 hover:text-red-700 text-sm font-semibold"
+                                                        >
+                                                            削除
+                                                        </button>
+                                                    </div>
+                                                    <div className="text-xs space-y-1 text-slate-600">
+                                                        <div>人件費計: <span className="text-blue-600">{formatCurrency(kpi.totalLaborCost)}円</span></div>
+                                                        <div>社保計: <span className="text-purple-600">{formatCurrency(kpi.totalSocialInsuranceCost)}円</span></div>
+                                                        <div>営業利益: <span className={kpi.operatingProfit >= 0 ? 'text-green-600' : 'text-red-600'}>{formatCurrency(kpi.operatingProfit)}円</span></div>
+                                                        <div>税引後: <span className={kpi.netProfit >= 0 ? 'text-green-600' : 'text-red-600'}>{formatCurrency(kpi.netProfit)}円</span></div>
+                                                        <div>キャッシュ: <span className={kpi.actualCash >= 0 ? 'text-green-600' : 'text-red-600'}>{formatCurrency(kpi.actualCash)}円</span></div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* 中央カラム：入力フォーム */}
+                            <div className="lg:col-span-5">
+                                <div className="bg-white rounded-lg shadow-lg p-6">
+                                    <div className="flex justify-between items-center mb-6 border-b pb-4">
+                                        <input
+                                            type="text"
+                                            value={selectedCompany.name}
+                                            onChange={(e) => updateCompany(selectedCompany.id, { name: e.target.value })}
+                                            className="text-2xl font-bold text-slate-800 bg-transparent border-b-2 border-transparent hover:border-blue-300 focus:border-blue-500 focus:outline-none transition-colors px-2"
+                                        />
+                                    </div>
+
+                                    <div className="space-y-6 custom-scrollbar max-h-[calc(100vh-250px)] overflow-y-auto pr-2">
+                                        {/* 課税事業者トグル */}
+                                        <div className="bg-slate-50 p-4 rounded-lg">
+                                            <h3 className="font-semibold text-slate-700 mb-3">前提条件</h3>
+                                            <div className="space-y-3">
+                                                <label className="flex items-center justify-between">
+                                                    <span className="text-slate-700">課税事業者</span>
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { isTaxable: !selectedCompany.isTaxable })}
+                                                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                                                            selectedCompany.isTaxable ? 'bg-blue-600' : 'bg-slate-300'
+                                                        }`}
+                                                    >
+                                                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                                            selectedCompany.isTaxable ? 'translate-x-6' : 'translate-x-1'
+                                                        }`} />
+                                                    </button>
+                                                </label>
+
+                                                <label className="flex items-center justify-between">
+                                                    <span className="text-slate-700">インボイス登録</span>
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { hasInvoice: !selectedCompany.hasInvoice })}
+                                                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                                                            selectedCompany.hasInvoice ? 'bg-blue-600' : 'bg-slate-300'
+                                                        }`}
+                                                    >
+                                                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                                            selectedCompany.hasInvoice ? 'translate-x-6' : 'translate-x-1'
+                                                        }`} />
+                                                    </button>
+                                                </label>
+                                            </div>
+                                            {/* 免税事業者等からの仕入れにおける経過措置（図表1） */}
+                                            <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+                                                <p className="text-xs font-semibold text-amber-800 mb-2">免税事業者等からの仕入れにおける経過措置</p>
+                                                <ul className="text-xs text-amber-900 space-y-1">
+                                                    <li>• 2023/10～2026/9: <strong>80%</strong>控除可能</li>
+                                                    <li>• 2026/10～2029/9: <strong>50%</strong>控除可能</li>
+                                                    <li>• 2029/10～: 控除不可</li>
+                                                </ul>
+                                                <p className="text-xs text-amber-700 mt-2">※インボイスなしの販管費・外注費は上記経過措置に基づき計算</p>
+                                                <p className="text-xs text-amber-600 mt-1">選択日付 {year}年{month}月: {getTaxExemptDeductionRate(year, month) * 100}%控除適用</p>
+                                            </div>
+                                        </div>
+
+                                        {/* ① 期首現金（年初残高） */}
+                                        <div className="bg-slate-50 p-4 rounded-lg">
+                                            <h3 className="font-semibold text-slate-700 mb-3">期首現金（年初残高）</h3>
+                                            <input
+                                                type="text"
+                                                value={formatInputValue(selectedCompany.beginningCash)}
+                                                onChange={(e) => updateCompany(selectedCompany.id, { beginningCash: parseNumber(e.target.value) })}
+                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                placeholder="0"
+                                            />
+                                            <p className="text-xs text-slate-500 mt-1">※未入力は0円。月次CF計算の初期値</p>
+                                        </div>
+
+                                        {/* ② 支払いサイト（月次CF用） */}
+                                        <div className="bg-teal-50 p-4 rounded-lg">
+                                            <h3 className="font-semibold text-slate-700 mb-3">支払いサイト（月次CF用）</h3>
+                                            <div className="space-y-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">A) 売上の入金サイト</label>
+                                                    <select
+                                                        value={selectedCompany.salesPaymentDays ?? 0}
+                                                        onChange={(e) => updateCompany(selectedCompany.id, { salesPaymentDays: Number(e.target.value) })}
+                                                        className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg"
+                                                    >
+                                                        <option value={0}>0日（当月入金）</option>
+                                                        <option value={30}>30日（翌月）</option>
+                                                        <option value={60}>60日（2ヶ月後）</option>
+                                                        <option value={90}>90日（3ヶ月後）</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">B) 販管費の支払いサイト</label>
+                                                    <select
+                                                        value={selectedCompany.expensePaymentDays ?? 0}
+                                                        onChange={(e) => updateCompany(selectedCompany.id, { expensePaymentDays: Number(e.target.value) })}
+                                                        className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg"
+                                                    >
+                                                        <option value={0}>0日（当月出金）</option>
+                                                        <option value={30}>30日（翌月）</option>
+                                                        <option value={60}>60日（2ヶ月後）</option>
+                                                        <option value={90}>90日（3ヶ月後）</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">C) 給与の支払いサイト</label>
+                                                    <select
+                                                        value={selectedCompany.salaryPaymentTerms || 'current'}
+                                                        onChange={(e) => updateCompany(selectedCompany.id, { salaryPaymentTerms: e.target.value })}
+                                                        className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg"
+                                                    >
+                                                        <option value="current">当月末（当月出金）</option>
+                                                        <option value="next">翌月末（翌月出金）</option>
+                                                    </select>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* ③ 税金の支払月 */}
+                                        <div className="bg-rose-50 p-4 rounded-lg">
+                                            <h3 className="font-semibold text-slate-700 mb-3">税金の支払月</h3>
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">法人税支払月</label>
+                                                    <select
+                                                        value={selectedCompany.corporateTaxMonth ?? 3}
+                                                        onChange={(e) => updateCompany(selectedCompany.id, { corporateTaxMonth: Number(e.target.value) })}
+                                                        className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg"
+                                                    >
+                                                        {[1,2,3,4,5,6,7,8,9,10,11,12].map(m => (
+                                                            <option key={m} value={m}>{m}月</option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">消費税支払月</label>
+                                                    <select
+                                                        value={selectedCompany.consumptionTaxMonth ?? 3}
+                                                        onChange={(e) => updateCompany(selectedCompany.id, { consumptionTaxMonth: Number(e.target.value) })}
+                                                        className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg"
+                                                    >
+                                                        {[1,2,3,4,5,6,7,8,9,10,11,12].map(m => (
+                                                            <option key={m} value={m}>{m}月</option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* 数値入力 */}
+                                        <div className="space-y-4">
+                                            <h3 className="font-semibold text-slate-700 mb-3">数値入力（税抜）</h3>
+                                            
+                                            <div>
+                                                <label className="block text-sm font-medium text-slate-700 mb-1">売上（税抜）</label>
+                                                <input
+                                                    type="text"
+                                                    value={formatInputValue(selectedCompany.revenue)}
+                                                    onChange={(e) => updateCompany(selectedCompany.id, { revenue: parseNumber(e.target.value) })}
+                                                    className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                    placeholder="0"
+                                                />
+                                            </div>
+
+                                            {/* 役員報酬 */}
+                                            <div className="bg-indigo-50 p-4 rounded-lg">
+                                                <h4 className="font-semibold text-slate-700 mb-3">役員報酬</h4>
+                                                <div className="flex gap-2 mb-3">
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { executiveCompensationInputMode: 'manual' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.executiveCompensationInputMode === 'manual'
+                                                                ? 'bg-indigo-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-indigo-400'
+                                                        }`}
+                                                    >
+                                                        手入力
+                                                    </button>
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { executiveCompensationInputMode: 'percent' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.executiveCompensationInputMode === 'percent'
+                                                                ? 'bg-indigo-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-indigo-400'
+                                                        }`}
+                                                    >
+                                                        ％で入力
+                                                    </button>
+                                                </div>
+
+                                                {selectedCompany.executiveCompensationInputMode === 'manual' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">役員報酬（税抜）</label>
+                                                        <input
+                                                            type="text"
+                                                            value={formatInputValue(selectedCompany.executiveCompensation)}
+                                                            onChange={(e) => updateCompany(selectedCompany.id, { executiveCompensation: parseNumber(e.target.value) })}
+                                                            className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                            placeholder="0"
+                                                        />
+                                                    </div>
+                                                )}
+
+                                                {selectedCompany.executiveCompensationInputMode === 'percent' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">役員報酬率（売上に対する％）</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="number"
+                                                                value={selectedCompany.executiveCompensationPercent || ''}
+                                                                onChange={(e) => updateCompany(selectedCompany.id, { executiveCompensationPercent: Number(e.target.value) || 0 })}
+                                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right pr-10"
+                                                                placeholder="10"
+                                                                step="0.1"
+                                                                min="0"
+                                                                max="100"
+                                                            />
+                                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 font-semibold">%</span>
+                                                        </div>
+                                                        <div className="mt-2 text-xs text-slate-600">
+                                                            計算額: {formatCurrency(selectedCompany.revenue * (selectedCompany.executiveCompensationPercent / 100))}円
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                <div className="mt-2 text-xs text-purple-600 font-semibold">
+                                                    社保概算: {formatCurrency((selectedCompany.executiveCompensationInputMode === 'percent' ? selectedCompany.revenue * (selectedCompany.executiveCompensationPercent / 100) : selectedCompany.executiveCompensation) * (selectedCompany.executiveSocialInsurancePercent / 100))}円
+                                                </div>
+                                            </div>
+
+                                            {/* 給与 */}
+                                            <div className="bg-blue-50 p-4 rounded-lg">
+                                                <h4 className="font-semibold text-slate-700 mb-3">給与</h4>
+                                                <div className="flex gap-2 mb-3">
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { salaryInputMode: 'manual' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.salaryInputMode === 'manual'
+                                                                ? 'bg-blue-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-blue-400'
+                                                        }`}
+                                                    >
+                                                        手入力
+                                                    </button>
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { salaryInputMode: 'percent' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.salaryInputMode === 'percent'
+                                                                ? 'bg-blue-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-blue-400'
+                                                        }`}
+                                                    >
+                                                        ％で入力
+                                                    </button>
+                                                </div>
+
+                                                {selectedCompany.salaryInputMode === 'manual' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">給与（税抜）</label>
+                                                        <input
+                                                            type="text"
+                                                            value={formatInputValue(selectedCompany.salary)}
+                                                            onChange={(e) => updateCompany(selectedCompany.id, { salary: parseNumber(e.target.value) })}
+                                                            className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                            placeholder="0"
+                                                        />
+                                                    </div>
+                                                )}
+
+                                                {selectedCompany.salaryInputMode === 'percent' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">給与率（売上に対する％）</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="number"
+                                                                value={selectedCompany.salaryPercent || ''}
+                                                                onChange={(e) => updateCompany(selectedCompany.id, { salaryPercent: Number(e.target.value) || 0 })}
+                                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right pr-10"
+                                                                placeholder="15"
+                                                                step="0.1"
+                                                                min="0"
+                                                                max="100"
+                                                            />
+                                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 font-semibold">%</span>
+                                                        </div>
+                                                        <div className="mt-2 text-xs text-slate-600">
+                                                            計算額: {formatCurrency(selectedCompany.revenue * (selectedCompany.salaryPercent / 100))}円
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                <div className="mt-2 text-xs text-purple-600 font-semibold">
+                                                    社保概算: {formatCurrency((selectedCompany.salaryInputMode === 'percent' ? selectedCompany.revenue * (selectedCompany.salaryPercent / 100) : selectedCompany.salary) * (selectedCompany.salarySocialInsurancePercent / 100))}円
+                                                </div>
+                                            </div>
+
+                                            {/* 外注費（インボイスあり） */}
+                                            <div className="bg-cyan-50 p-4 rounded-lg">
+                                                <h4 className="font-semibold text-slate-700 mb-3">外注費（インボイスあり）</h4>
+                                                <div className="flex gap-2 mb-3">
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { outsourcingWithInvoiceInputMode: 'manual' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.outsourcingWithInvoiceInputMode === 'manual'
+                                                                ? 'bg-cyan-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-cyan-400'
+                                                        }`}
+                                                    >
+                                                        手入力
+                                                    </button>
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { outsourcingWithInvoiceInputMode: 'percent' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.outsourcingWithInvoiceInputMode === 'percent'
+                                                                ? 'bg-cyan-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-cyan-400'
+                                                        }`}
+                                                    >
+                                                        ％で入力
+                                                    </button>
+                                                </div>
+
+                                                {selectedCompany.outsourcingWithInvoiceInputMode === 'manual' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">外注費（税抜）</label>
+                                                        <input
+                                                            type="text"
+                                                            value={formatInputValue(selectedCompany.outsourcingWithInvoice)}
+                                                            onChange={(e) => updateCompany(selectedCompany.id, { outsourcingWithInvoice: parseNumber(e.target.value) })}
+                                                            className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                            placeholder="0"
+                                                        />
+                                                    </div>
+                                                )}
+
+                                                {selectedCompany.outsourcingWithInvoiceInputMode === 'percent' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">外注費率（売上に対する％）</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="number"
+                                                                value={selectedCompany.outsourcingWithInvoicePercent || ''}
+                                                                onChange={(e) => updateCompany(selectedCompany.id, { outsourcingWithInvoicePercent: Number(e.target.value) || 0 })}
+                                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right pr-10"
+                                                                placeholder="5"
+                                                                step="0.1"
+                                                                min="0"
+                                                                max="100"
+                                                            />
+                                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 font-semibold">%</span>
+                                                        </div>
+                                                        <div className="mt-2 text-xs text-slate-600">
+                                                            計算額: {formatCurrency(selectedCompany.revenue * (selectedCompany.outsourcingWithInvoicePercent / 100))}円
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* 外注費（インボイスなし） */}
+                                            <div className="bg-pink-50 p-4 rounded-lg">
+                                                <h4 className="font-semibold text-slate-700 mb-3">外注費（インボイスなし／免税事業者等）</h4>
+                                                <p className="text-xs text-pink-700 mb-2">※{year}年{month}月: 経過措置により{getTaxExemptDeductionRate(year, month) * 100}%控除可能</p>
+                                                <div className="flex gap-2 mb-3">
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { outsourcingWithoutInvoiceInputMode: 'manual' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.outsourcingWithoutInvoiceInputMode === 'manual'
+                                                                ? 'bg-pink-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-pink-400'
+                                                        }`}
+                                                    >
+                                                        手入力
+                                                    </button>
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { outsourcingWithoutInvoiceInputMode: 'percent' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.outsourcingWithoutInvoiceInputMode === 'percent'
+                                                                ? 'bg-pink-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-pink-400'
+                                                        }`}
+                                                    >
+                                                        ％で入力
+                                                    </button>
+                                                </div>
+
+                                                {selectedCompany.outsourcingWithoutInvoiceInputMode === 'manual' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">外注費（税抜）</label>
+                                                        <input
+                                                            type="text"
+                                                            value={formatInputValue(selectedCompany.outsourcingWithoutInvoice)}
+                                                            onChange={(e) => updateCompany(selectedCompany.id, { outsourcingWithoutInvoice: parseNumber(e.target.value) })}
+                                                            className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                            placeholder="0"
+                                                        />
+                                                    </div>
+                                                )}
+
+                                                {selectedCompany.outsourcingWithoutInvoiceInputMode === 'percent' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">外注費率（売上に対する％）</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="number"
+                                                                value={selectedCompany.outsourcingWithoutInvoicePercent || ''}
+                                                                onChange={(e) => updateCompany(selectedCompany.id, { outsourcingWithoutInvoicePercent: Number(e.target.value) || 0 })}
+                                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right pr-10"
+                                                                placeholder="0"
+                                                                step="0.1"
+                                                                min="0"
+                                                                max="100"
+                                                            />
+                                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 font-semibold">%</span>
+                                                        </div>
+                                                        <div className="mt-2 text-xs text-slate-600">
+                                                            計算額: {formatCurrency(selectedCompany.revenue * (selectedCompany.outsourcingWithoutInvoicePercent / 100))}円
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* 販管費（インボイスあり） */}
+                                            <div className="bg-green-50 p-4 rounded-lg">
+                                                <h4 className="font-semibold text-slate-700 mb-3">その他販管費（インボイスあり）</h4>
+                                                {/* 入力方式選択 */}
+                                                <div className="flex gap-2 mb-3">
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { expenseWithInvoiceInputMode: 'manual' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.expenseWithInvoiceInputMode === 'manual'
+                                                                ? 'bg-green-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-green-400'
+                                                        }`}
+                                                    >
+                                                        手入力
+                                                    </button>
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { expenseWithInvoiceInputMode: 'percent' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.expenseWithInvoiceInputMode === 'percent'
+                                                                ? 'bg-green-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-green-400'
+                                                        }`}
+                                                    >
+                                                        ％で入力
+                                                    </button>
+                                                </div>
+
+                                                {/* 手入力モード */}
+                                                {selectedCompany.expenseWithInvoiceInputMode === 'manual' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">販管費（税抜）</label>
+                                                        <input
+                                                            type="text"
+                                                            value={formatInputValue(selectedCompany.expenseWithInvoice)}
+                                                            onChange={(e) => updateCompany(selectedCompany.id, { expenseWithInvoice: parseNumber(e.target.value) })}
+                                                            className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                            placeholder="0"
+                                                        />
+                                                    </div>
+                                                )}
+
+                                                {/* パーセントモード */}
+                                                {selectedCompany.expenseWithInvoiceInputMode === 'percent' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">販管費率（売上に対する％）</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="number"
+                                                                value={selectedCompany.expenseWithInvoicePercent || ''}
+                                                                onChange={(e) => updateCompany(selectedCompany.id, { expenseWithInvoicePercent: Number(e.target.value) || 0 })}
+                                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right pr-10"
+                                                                placeholder="20"
+                                                                step="0.1"
+                                                                min="0"
+                                                                max="100"
+                                                            />
+                                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 font-semibold">%</span>
+                                                        </div>
+                                                        <div className="mt-2 text-xs text-slate-600">
+                                                            計算額: {formatCurrency(selectedCompany.revenue * (selectedCompany.expenseWithInvoicePercent / 100))}円
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* 販管費（インボイスなし） */}
+                                            <div className="bg-orange-50 p-4 rounded-lg">
+                                                <h4 className="font-semibold text-slate-700 mb-3">その他販管費（インボイスなし／免税事業者等）</h4>
+                                                <p className="text-xs text-orange-700 mb-2">※{year}年{month}月: 経過措置により{getTaxExemptDeductionRate(year, month) * 100}%控除可能</p>
+                                                {/* 入力方式選択 */}
+                                                <div className="flex gap-2 mb-3">
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { expenseWithoutInvoiceInputMode: 'manual' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.expenseWithoutInvoiceInputMode === 'manual'
+                                                                ? 'bg-orange-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-orange-400'
+                                                        }`}
+                                                    >
+                                                        手入力
+                                                    </button>
+                                                    <button
+                                                        onClick={() => updateCompany(selectedCompany.id, { expenseWithoutInvoiceInputMode: 'percent' })}
+                                                        className={`flex-1 px-3 py-2 rounded-lg font-semibold text-sm transition-colors ${
+                                                            selectedCompany.expenseWithoutInvoiceInputMode === 'percent'
+                                                                ? 'bg-orange-600 text-white'
+                                                                : 'bg-white text-slate-700 border-2 border-slate-300 hover:border-orange-400'
+                                                        }`}
+                                                    >
+                                                        ％で入力
+                                                    </button>
+                                                </div>
+
+                                                {/* 手入力モード */}
+                                                {selectedCompany.expenseWithoutInvoiceInputMode === 'manual' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">販管費（税抜）</label>
+                                                        <input
+                                                            type="text"
+                                                            value={formatInputValue(selectedCompany.expenseWithoutInvoice)}
+                                                            onChange={(e) => updateCompany(selectedCompany.id, { expenseWithoutInvoice: parseNumber(e.target.value) })}
+                                                            className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                            placeholder="0"
+                                                        />
+                                                    </div>
+                                                )}
+
+                                                {/* パーセントモード */}
+                                                {selectedCompany.expenseWithoutInvoiceInputMode === 'percent' && (
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-1">販管費率（売上に対する％）</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="number"
+                                                                value={selectedCompany.expenseWithoutInvoicePercent || ''}
+                                                                onChange={(e) => updateCompany(selectedCompany.id, { expenseWithoutInvoicePercent: Number(e.target.value) || 0 })}
+                                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right pr-10"
+                                                                placeholder="5"
+                                                                step="0.1"
+                                                                min="0"
+                                                                max="100"
+                                                            />
+                                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 font-semibold">%</span>
+                                                        </div>
+                                                        <div className="mt-2 text-xs text-slate-600">
+                                                            計算額: {formatCurrency(selectedCompany.revenue * (selectedCompany.expenseWithoutInvoicePercent / 100))}円
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {/* 社保会社負担 */}
+                                        <div className="bg-amber-50 p-4 rounded-lg">
+                                            <label className="flex items-center justify-between mb-3">
+                                                <span className="text-slate-700 font-semibold">社保会社負担を人件費に含める</span>
+                                                <button
+                                                    onClick={() => updateCompany(selectedCompany.id, { includeSocialInsurance: !selectedCompany.includeSocialInsurance })}
+                                                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                                                        selectedCompany.includeSocialInsurance ? 'bg-blue-600' : 'bg-slate-300'
+                                                    }`}
+                                                >
+                                                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                                        selectedCompany.includeSocialInsurance ? 'translate-x-6' : 'translate-x-1'
+                                                    }`} />
+                                                </button>
+                                            </label>
+
+                                            {!selectedCompany.includeSocialInsurance && (
+                                                <div className="space-y-4">
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-2">役員報酬の社保料率（％）</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="number"
+                                                                value={selectedCompany.executiveSocialInsurancePercent || ''}
+                                                                onChange={(e) => updateCompany(selectedCompany.id, { executiveSocialInsurancePercent: Number(e.target.value) || 0 })}
+                                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right pr-10"
+                                                                placeholder="15"
+                                                                step="0.1"
+                                                                min="0"
+                                                                max="100"
+                                                            />
+                                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 font-semibold">%</span>
+                                                        </div>
+                                                    </div>
+                                                    
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-slate-700 mb-2">給与の社保料率（％）</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="number"
+                                                                value={selectedCompany.salarySocialInsurancePercent || ''}
+                                                                onChange={(e) => updateCompany(selectedCompany.id, { salarySocialInsurancePercent: Number(e.target.value) || 0 })}
+                                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right pr-10"
+                                                                placeholder="15"
+                                                                step="0.1"
+                                                                min="0"
+                                                                max="100"
+                                                            />
+                                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 font-semibold">%</span>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="bg-purple-100 p-3 rounded-lg">
+                                                        <div className="text-sm font-semibold text-purple-800">社保合計概算</div>
+                                                        <div className="text-xl font-bold text-purple-900 mt-1">
+                                                            {formatCurrency(
+                                                                ((selectedCompany.executiveCompensationInputMode === 'percent' 
+                                                                    ? selectedCompany.revenue * (selectedCompany.executiveCompensationPercent / 100) 
+                                                                    : selectedCompany.executiveCompensation) * (selectedCompany.executiveSocialInsurancePercent / 100)) +
+                                                                ((selectedCompany.salaryInputMode === 'percent' 
+                                                                    ? selectedCompany.revenue * (selectedCompany.salaryPercent / 100) 
+                                                                    : selectedCompany.salary) * (selectedCompany.salarySocialInsurancePercent / 100))
+                                                            )}円
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* 右カラム：結果表示 */}
+                            <div className="lg:col-span-4">
+                                <div className="space-y-6">
+                                    {/* グループ合算KPI */}
+                                    {showGroupView && (
+                                        <div className="bg-gradient-to-br from-blue-600 to-blue-700 rounded-lg shadow-xl p-6 text-white">
+                                            <h2 className="text-2xl font-bold mb-4 flex items-center">
+                                                <span className="mr-2">📊</span>
+                                                グループ合算
+                                            </h2>
+                                            <div className="space-y-3">
+                                                <div className="bg-white/10 backdrop-blur rounded-lg p-3">
+                                                    <div className="text-sm opacity-90 mb-1">税込売上（入金）</div>
+                                                    <div className="text-2xl font-bold text-blue-200">{formatCurrency(groupKPI.taxIncludedRevenue)}円</div>
+                                                </div>
+                                                <div className="bg-white/10 backdrop-blur rounded-lg p-3">
+                                                    <div className="text-sm opacity-90 mb-1">預かり消費税</div>
+                                                    <div className="text-xl font-bold text-yellow-200">{formatCurrency(groupKPI.receivedConsumptionTax)}円</div>
+                                                </div>
+                                                <div className="bg-white/10 backdrop-blur rounded-lg p-3">
+                                                    <div className="text-sm opacity-90 mb-1">営業利益（税抜）</div>
+                                                    <div className={`text-3xl font-bold ${groupKPI.operatingProfit >= 0 ? 'text-green-300' : 'text-red-300'}`}>
+                                                        {groupKPI.operatingProfit >= 0 ? '+' : ''}{formatCurrency(groupKPI.operatingProfit)}円
+                                                    </div>
+                                                </div>
+                                                <div className="bg-white/10 backdrop-blur rounded-lg p-3">
+                                                    <div className="text-sm opacity-90 mb-1">消費税納付額</div>
+                                                    <div className="text-2xl font-bold">{formatCurrency(groupKPI.consumptionTax)}円</div>
+                                                </div>
+                                                <div className="bg-white/10 backdrop-blur rounded-lg p-3">
+                                                    <div className="text-sm opacity-90 mb-1">法人税等</div>
+                                                    <div className="text-2xl font-bold">{formatCurrency(groupKPI.corporateTax)}円</div>
+                                                </div>
+                                                <div className="bg-white/10 backdrop-blur rounded-lg p-3">
+                                                    <div className="text-sm opacity-90 mb-1">社会保険料合計</div>
+                                                    <div className="text-2xl font-bold text-purple-200">{formatCurrency(groupKPI.totalSocialInsuranceCost)}円</div>
+                                                </div>
+                                                <div className="bg-white/10 backdrop-blur rounded-lg p-3">
+                                                    <div className="text-sm opacity-90 mb-1">税引後利益（税抜）</div>
+                                                    <div className={`text-2xl font-bold ${groupKPI.netProfit >= 0 ? 'text-green-300' : 'text-red-300'}`}>
+                                                        {groupKPI.netProfit >= 0 ? '+' : ''}{formatCurrency(groupKPI.netProfit)}円
+                                                    </div>
+                                                </div>
+                                                <div className="bg-white/20 backdrop-blur rounded-lg p-4 border-2 border-white/30">
+                                                    <div className="text-base opacity-90 mb-1 font-bold">💰 実質キャッシュ残高</div>
+                                                    <div className={`text-4xl font-bold ${groupKPI.actualCash >= 0 ? 'text-green-300' : 'text-red-300'}`}>
+                                                        {groupKPI.actualCash >= 0 ? '+' : ''}{formatCurrency(groupKPI.actualCash)}円
+                                                    </div>
+                                                    <div className="text-xs opacity-75 mt-2">税込売上ベースで計算</div>
+                                                </div>
+                                            </div>
+
+                                            {/* ⑥ グループ合算 月次CFテーブル・グラフ */}
+                                            <div className="space-y-4 mt-4">
+                                                <MonthlyCFTable data={calculateGroupMonthlyCF(companies, year)} year={year} isGroup />
+                                                <CashFlowChart data={calculateGroupMonthlyCF(companies, year)} year={year} isGroup />
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* 個社KPI */}
+                                    <div className="bg-white rounded-lg shadow-lg p-6">
+                                        <h2 className="text-xl font-bold text-slate-800 mb-4 border-b pb-2">
+                                            {selectedCompany.name} の結果
+                                        </h2>
+                                        <div className="space-y-3">
+                                            {(() => {
+                                                const kpi = calculateKPI(selectedCompany, year, month);
+                                                return (
+                                                    <>
+                                                        <div className="bg-blue-50 rounded-lg p-3 border-2 border-blue-200">
+                                                            <div className="text-xs text-slate-600 mb-1">税込売上（入金）</div>
+                                                            <div className="text-xl font-bold text-blue-700">{formatCurrency(kpi.taxIncludedRevenue)}円</div>
+                                                        </div>
+                                                        <div className="bg-yellow-50 rounded-lg p-3 border-2 border-yellow-200">
+                                                            <div className="text-xs text-slate-600 mb-1">預かり消費税</div>
+                                                            <div className="text-lg font-bold text-yellow-700">{formatCurrency(kpi.receivedConsumptionTax)}円</div>
+                                                        </div>
+                                                        <KPICard title="営業利益（税抜）" value={kpi.operatingProfit} />
+                                                        <KPICard title="消費税納付額" value={kpi.consumptionTax} />
+                                                        <div className="bg-red-50 rounded-lg p-3 border-2 border-red-200">
+                                                            <div className="text-xs text-slate-600 mb-1">法人税等合計</div>
+                                                            <div className="text-lg font-bold text-red-700">{formatCurrency(kpi.corporateTax)}円</div>
+                                                            <div className="text-xs text-slate-500 mt-2 space-y-1">
+                                                                <div>法人税: {formatCurrency(kpi.nationalCorporateTax)}円</div>
+                                                                <div>地方法人税: {formatCurrency(kpi.localCorporateTax)}円</div>
+                                                                <div>法人事業税: {formatCurrency(kpi.businessTax)}円</div>
+                                                                <div>特別法人事業税: {formatCurrency(kpi.specialBusinessTax)}円</div>
+                                                                <div>法人住民税: {formatCurrency(kpi.residentTax)}円</div>
+                                                            </div>
+                                                        </div>
+                                                        <div className="bg-purple-50 rounded-lg p-3 border-2 border-purple-200">
+                                                            <div className="text-xs text-slate-600 mb-1">社会保険料合計</div>
+                                                            <div className="text-lg font-bold text-purple-700">{formatCurrency(kpi.totalSocialInsuranceCost)}円</div>
+                                                            <div className="text-xs text-slate-500 mt-1">
+                                                                役員: {formatCurrency(kpi.executiveSocialInsuranceCost)}円 / 
+                                                                給与: {formatCurrency(kpi.salarySocialInsuranceCost)}円
+                                                            </div>
+                                                        </div>
+                                                        <KPICard title="税引後利益（税抜）" value={kpi.netProfit} />
+                                                        <div className="bg-gradient-to-r from-green-50 to-blue-50 rounded-lg p-4 border-3 border-green-400 shadow-lg">
+                                                            <div className="text-sm text-slate-700 font-bold mb-1">💰 実質キャッシュ残高</div>
+                                                            <div className={`text-3xl font-bold ${kpi.actualCash >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                                                {kpi.actualCash >= 0 ? '+' : ''}{formatCurrency(kpi.actualCash)}円
+                                                            </div>
+                                                            <div className="text-xs text-slate-500 mt-1">税込売上ベースで計算</div>
+                                                        </div>
+
+                                                        {/* ⑤ 個社 月次CFテーブル・グラフ */}
+                                                        <div className="space-y-4 mt-4">
+                                                            <MonthlyCFTable data={calculateMonthlyCashFlow(selectedCompany, year)} year={year} />
+                                                            <CashFlowChart data={calculateMonthlyCashFlow(selectedCompany, year)} year={year} />
+                                                        </div>
+                                                    </>
+                                                );
+                                            })()}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* フッター */}
+                    <footer className="bg-slate-800 text-white text-center py-4 mt-8">
+                        <p className="text-sm">© 2025 経営用キャッシュフローツール | 概算計算用（正確な税務計算は税理士にご相談ください）</p>
+                    </footer>
+                </div>
+            );
+        };
+
+        // レンダリング
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
