@@ -43,7 +43,7 @@
         const { useState, useEffect } = React;
 
         // ローカルストレージキー
-        const STORAGE_KEY = 'tax_simulator_data_v2'; // v2: 月次CF・期首現金・サイト追加
+        const STORAGE_KEY = 'tax_simulator_data_v4'; // v4: 中間消費税・法人税中間申告追加
 
         // 初期会社データ
         const createInitialCompany = (id, name) => ({
@@ -98,7 +98,21 @@
 
             // ③ 税金の支払月（1〜12）
             corporateTaxMonth: 3,
-            consumptionTaxMonth: 3
+            consumptionTaxMonth: 3,
+
+            // 中間消費税申告用
+            previousPeriodConsumptionTax: 0,
+            businessType: 'corporation',
+            taxPeriodStartMonth: 4,
+            hasExtension: false,
+
+            // 法人税中間申告用
+            previousPeriodCorporateTax: 0,
+            previousFiscalMonths: 12,
+            capitalAmount: 0,
+            isLargeCorpSubsidiary: false,
+            entityType: '普通法人',
+            interimIncome: 0
         });
 
         // 免税事業者等からの仕入れにおける経過措置の控除率を取得
@@ -106,9 +120,100 @@
         // 2023/10/1～2026/9/30: 80% | 2026/10/1～2029/9/30: 50% | 2029/10/1～: 控除不可
         const getTaxExemptDeductionRate = (year, month) => {
             const dateValue = year * 100 + (month || 1);
-            if (dateValue < 202610) return 0.8;   // 2026年10月未満: 80%
-            if (dateValue < 202910) return 0.5;   // 2029年10月未満: 50%
-            return 0;                              // それ以降: 控除不可
+            if (dateValue < 202610) return 0.8;
+            if (dateValue < 202910) return 0.5;
+            return 0;
+        };
+
+        // ============================================================
+        // 中間消費税申告ロジック
+        // ============================================================
+        const THRESHOLD_48 = 480000;
+        const THRESHOLD_400 = 4000000;
+        const THRESHOLD_4800 = 48000000;
+        const LOCAL_TAX_RATIO = 22 / 78;
+
+        const calculateInterimConsumptionTax = (company, year) => {
+            const tax = company.previousPeriodConsumptionTax || 0;
+            const startMonth = company.taxPeriodStartMonth || 4;
+            const isCorp = company.businessType === 'corporation';
+            const hasExt = !!company.hasExtension;
+            let interimCount = 0;
+            let isRequired = false;
+            if (tax <= THRESHOLD_48) { interimCount = 0; isRequired = false; }
+            else if (tax <= THRESHOLD_400) { interimCount = 1; isRequired = true; }
+            else if (tax <= THRESHOLD_4800) { interimCount = 3; isRequired = true; }
+            else { interimCount = 11; isRequired = true; }
+            const periods = [];
+            if (interimCount === 0) return { isRequired, interimCount, periods, note: '48万円以下は原則不要（任意申告制度あり）' };
+            const monthsPerPeriod = interimCount === 1 ? 6 : interimCount === 3 ? 4 : 1;
+            const taxRatio = monthsPerPeriod / 12;
+            for (let i = 0; i < interimCount; i++) {
+                const consumptionTaxAmount = Math.round(tax * taxRatio);
+                const localTaxAmount = Math.round(consumptionTaxAmount * LOCAL_TAX_RATIO);
+                const totalAmount = consumptionTaxAmount + localTaxAmount;
+                let dueYear = year, dueMonth;
+                const periodEndMonth1 = startMonth + (i + 1) * monthsPerPeriod - 1;
+                const periodEndYear = year + Math.floor((periodEndMonth1 - 1) / 12);
+                const periodEndMonth = ((periodEndMonth1 - 1) % 12) + 1;
+                if (isCorp && hasExt && i === 0) {
+                    const t = startMonth + 5;
+                    dueMonth = ((t - 1) % 12) + 1;
+                    dueYear = year + Math.floor((t - 1) / 12);
+                } else {
+                    dueMonth = periodEndMonth + 2 > 12 ? periodEndMonth - 10 : periodEndMonth + 2;
+                    dueYear = periodEndMonth + 2 > 12 ? periodEndYear + 1 : periodEndYear;
+                }
+                periods.push({ periodNum: i + 1, consumptionTax: consumptionTaxAmount, localConsumptionTax: localTaxAmount, total: totalAmount, dueDate: `${dueYear}年${dueMonth}月` });
+            }
+            return { isRequired, interimCount, periods, note: null };
+        };
+
+        // ============================================================
+        // 法人税中間申告ロジック
+        // ============================================================
+        const INTERIM_THRESHOLD = 100000;
+        const CAPITAL_1B = 100000000;
+        const INCOME_10B = 1000000000;
+        const LOCAL_CORP_TAX_RATE = 0.103;
+
+        const calculateInterimCorporateTax = (company) => {
+            const prevTax = company.previousPeriodCorporateTax || 0;
+            const prevMonths = company.previousFiscalMonths || 12;
+            const capital = company.capitalAmount || 0;
+            const isLargeSub = !!company.isLargeCorpSubsidiary;
+            const entityType = company.entityType || '普通法人';
+            const income6m = company.interimIncome || 0;
+            const scheduledBaseTax = prevTax * 6 / prevMonths;
+            const isRequired = scheduledBaseTax > INTERIM_THRESHOLD;
+            const scheduledNationalTax = Math.round(scheduledBaseTax);
+            const scheduledLocalTax = Math.round(scheduledNationalTax * LOCAL_CORP_TAX_RATE);
+            const scheduledTotal = scheduledNationalTax + scheduledLocalTax;
+            let rateBasis = '普通法人';
+            const isSmallCorp = capital <= CAPITAL_1B && !isLargeSub;
+            if (entityType === '医療法人') rateBasis = '特定の医療法人';
+            else if (capital > CAPITAL_1B || isLargeSub) rateBasis = '資本金1億円超の普通法人又は大法人100%子会社';
+            else rateBasis = '中小法人（資本金1億円以下）';
+            let provisionalNationalTax = 0;
+            let provisionalNote = null;
+            if (income6m > 0) {
+                const incomeAnnual = income6m * 2;
+                const threshold6m = 4000000;
+                if (entityType === '医療法人') {
+                    provisionalNationalTax = Math.round(Math.min(income6m, threshold6m) * 0.15 + Math.max(0, income6m - threshold6m) * 0.19);
+                } else if (!isSmallCorp) {
+                    provisionalNationalTax = Math.round(income6m * 0.232);
+                } else {
+                    const rate1 = incomeAnnual > INCOME_10B ? 0.17 : 0.15;
+                    provisionalNationalTax = Math.round(Math.min(income6m, threshold6m) * rate1 + Math.max(0, income6m - threshold6m) * 0.232);
+                }
+            } else if (income6m < 0) {
+                provisionalNationalTax = 0;
+                provisionalNote = '仮決算で赤字の場合、中間申告で還付は受けられない（0円）';
+            }
+            const provisionalLocalTax = Math.round(provisionalNationalTax * LOCAL_CORP_TAX_RATE);
+            const provisionalTotal = provisionalNationalTax + provisionalLocalTax;
+            return { isRequired, scheduledNationalTax, scheduledLocalTax, scheduledTotal, provisionalNationalTax, provisionalLocalTax, provisionalTotal, rateBasis, provisionalNote, hasProvisionalInput: income6m !== 0 };
         };
 
         // 計算関数
@@ -532,10 +637,12 @@
             const [showGroupView, setShowGroupView] = useState(true);
             const [nextId, setNextId] = useState(2);
 
-            // LocalStorage からデータ読み込み（v1からの移行対応）
+            // LocalStorage からデータ読み込み（v1/v2/v3からの移行対応）
             useEffect(() => {
                 try {
                     let saved = localStorage.getItem(STORAGE_KEY);
+                    if (!saved) saved = localStorage.getItem('tax_simulator_data_v3');
+                    if (!saved) saved = localStorage.getItem('tax_simulator_data_v2');
                     if (!saved) saved = localStorage.getItem('tax_simulator_data_v1');
                     if (saved) {
                         const data = JSON.parse(saved);
@@ -575,7 +682,17 @@
                             expensePaymentDays: company.expensePaymentDays ?? 0,
                             salaryPaymentTerms: company.salaryPaymentTerms || 'current',
                             corporateTaxMonth: company.corporateTaxMonth ?? 3,
-                            consumptionTaxMonth: company.consumptionTaxMonth ?? 3
+                            consumptionTaxMonth: company.consumptionTaxMonth ?? 3,
+                            previousPeriodConsumptionTax: company.previousPeriodConsumptionTax ?? 0,
+                            businessType: company.businessType || 'corporation',
+                            taxPeriodStartMonth: company.taxPeriodStartMonth ?? 4,
+                            hasExtension: company.hasExtension ?? false,
+                            previousPeriodCorporateTax: company.previousPeriodCorporateTax ?? 0,
+                            previousFiscalMonths: company.previousFiscalMonths ?? 12,
+                            capitalAmount: company.capitalAmount ?? 0,
+                            isLargeCorpSubsidiary: company.isLargeCorpSubsidiary ?? false,
+                            entityType: company.entityType || '普通法人',
+                            interimIncome: company.interimIncome ?? 0
                         }));
                         setCompanies(companiesWithDefaults);
                         setSelectedCompanyId(data.selectedCompanyId || 1);
@@ -929,6 +1046,77 @@
                                                             <option key={m} value={m}>{m}月</option>
                                                         ))}
                                                     </select>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* 中間消費税申告（入力） */}
+                                        <div className="bg-violet-50 p-4 rounded-lg border border-violet-200">
+                                            <h3 className="font-semibold text-slate-700 mb-3">中間消費税申告</h3>
+                                            <p className="text-xs text-slate-600 mb-3">※直前課税期間の確定消費税額（地方消費税除く）で判定</p>
+                                            <div className="space-y-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">直前の確定消費税額（国税のみ）円</label>
+                                                    <input type="text" value={formatInputValue(selectedCompany.previousPeriodConsumptionTax)} onChange={(e) => updateCompany(selectedCompany.id, { previousPeriodConsumptionTax: parseNumber(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-violet-500 focus:outline-none text-right" placeholder="0" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">事業者区分</label>
+                                                    <select value={selectedCompany.businessType || 'corporation'} onChange={(e) => updateCompany(selectedCompany.id, { businessType: e.target.value })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg">
+                                                        <option value="individual">個人事業者</option>
+                                                        <option value="corporation">法人</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">課税期間開始月</label>
+                                                    <select value={selectedCompany.taxPeriodStartMonth ?? 4} onChange={(e) => updateCompany(selectedCompany.id, { taxPeriodStartMonth: Number(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg">
+                                                        {[1,2,3,4,5,6,7,8,9,10,11,12].map(m => <option key={m} value={m}>{m}月</option>)}
+                                                    </select>
+                                                </div>
+                                                {selectedCompany.businessType === 'corporation' && (
+                                                    <label className="flex items-center gap-2">
+                                                        <input type="checkbox" checked={selectedCompany.hasExtension ?? false} onChange={(e) => updateCompany(selectedCompany.id, { hasExtension: e.target.checked })} className="rounded" />
+                                                        <span className="text-sm text-slate-700">確定申告期限延長特例を受けている</span>
+                                                    </label>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {/* 法人税中間申告（入力） */}
+                                        <div className="bg-emerald-50 p-4 rounded-lg border border-emerald-200">
+                                            <h3 className="font-semibold text-slate-700 mb-3">法人税中間申告</h3>
+                                            <div className="space-y-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">直前事業年度の確定法人税額（円）</label>
+                                                    <input type="text" value={formatInputValue(selectedCompany.previousPeriodCorporateTax)} onChange={(e) => updateCompany(selectedCompany.id, { previousPeriodCorporateTax: parseNumber(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-emerald-500 focus:outline-none text-right" placeholder="0" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">直前事業年度の月数</label>
+                                                    <select value={selectedCompany.previousFiscalMonths ?? 12} onChange={(e) => updateCompany(selectedCompany.id, { previousFiscalMonths: Number(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg">
+                                                        <option value={12}>12か月</option>
+                                                        <option value={6}>6か月</option>
+                                                        <option value={3}>3か月</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">資本金額（円）</label>
+                                                    <input type="text" value={formatInputValue(selectedCompany.capitalAmount)} onChange={(e) => updateCompany(selectedCompany.id, { capitalAmount: parseNumber(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-emerald-500 focus:outline-none text-right" placeholder="0" />
+                                                    <p className="text-xs text-slate-500 mt-1">※1億円超で大法人税率</p>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">法人区分</label>
+                                                    <select value={selectedCompany.entityType || '普通法人'} onChange={(e) => updateCompany(selectedCompany.id, { entityType: e.target.value })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg">
+                                                        <option value="普通法人">普通法人</option>
+                                                        <option value="医療法人">特定の医療法人</option>
+                                                    </select>
+                                                </div>
+                                                <label className="flex items-center gap-2">
+                                                    <input type="checkbox" checked={selectedCompany.isLargeCorpSubsidiary ?? false} onChange={(e) => updateCompany(selectedCompany.id, { isLargeCorpSubsidiary: e.target.checked })} className="rounded" />
+                                                    <span className="text-sm text-slate-700">大法人100%子会社</span>
+                                                </label>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">仮決算用所得（6か月分・円）</label>
+                                                    <input type="text" value={formatInputValue(selectedCompany.interimIncome)} onChange={(e) => updateCompany(selectedCompany.id, { interimIncome: parseNumber(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-emerald-500 focus:outline-none text-right" placeholder="0" />
+                                                    <p className="text-xs text-slate-500 mt-1">※入力時のみ仮決算方式の税額を計算</p>
                                                 </div>
                                             </div>
                                         </div>
@@ -1514,6 +1702,74 @@
                                                             </div>
                                                             <div className="text-xs text-slate-500 mt-1">税込売上ベースで計算</div>
                                                         </div>
+
+                                                        {/* 中間消費税申告（出力） */}
+                                                        {(() => {
+                                                            const interim = calculateInterimConsumptionTax(selectedCompany, year);
+                                                            return (
+                                                                <div className="bg-violet-50 rounded-lg p-4 border-2 border-violet-200">
+                                                                    <h3 className="font-bold text-slate-800 mb-2">中間消費税申告</h3>
+                                                                    <div className="space-y-2 text-sm">
+                                                                        <div><strong>必要性:</strong> {interim.isRequired ? '有' : '無'}{interim.note && ` (${interim.note})`}</div>
+                                                                        <div><strong>申告・納税回数:</strong> {interim.interimCount === 0 ? '0回（任意）' : `${interim.interimCount}回/年`}</div>
+                                                                        {interim.periods.length > 0 && (
+                                                                            <div className="mt-3 overflow-x-auto">
+                                                                                <table className="w-full text-xs">
+                                                                                    <thead><tr className="bg-violet-100"><th className="px-2 py-1 text-left">回</th><th className="px-2 py-1 text-right">消費税</th><th className="px-2 py-1 text-right">地方消費税</th><th className="px-2 py-1 text-right">合計</th><th className="px-2 py-1 text-left">納付期限</th></tr></thead>
+                                                                                    <tbody>
+                                                                                        {interim.periods.map(p => (
+                                                                                            <tr key={p.periodNum} className="border-t border-violet-200">
+                                                                                                <td className="px-2 py-1">{p.periodNum}</td>
+                                                                                                <td className="px-2 py-1 text-right">{formatCurrency(p.consumptionTax)}円</td>
+                                                                                                <td className="px-2 py-1 text-right">{formatCurrency(p.localConsumptionTax)}円</td>
+                                                                                                <td className="px-2 py-1 text-right font-semibold">{formatCurrency(p.total)}円</td>
+                                                                                                <td className="px-2 py-1">{p.dueDate}</td>
+                                                                                            </tr>
+                                                                                        ))}
+                                                                                    </tbody>
+                                                                                </table>
+                                                                            </div>
+                                                                        )}
+                                                                        <p className="text-xs text-slate-500 mt-2">※提出なし＝前年実績での納付義務発生（みなし申告）</p>
+                                                                        <p className="text-xs text-slate-500">※仮決算で還付となる場合も中間申告では0円</p>
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })()}
+
+                                                        {/* 法人税中間申告（出力） */}
+                                                        {(() => {
+                                                            const corp = calculateInterimCorporateTax(selectedCompany);
+                                                            return (
+                                                                <div className="bg-emerald-50 rounded-lg p-4 border-2 border-emerald-200">
+                                                                    <h3 className="font-bold text-slate-800 mb-2">法人税中間申告</h3>
+                                                                    <div className="space-y-2 text-sm">
+                                                                        <div><strong>中間申告の要否:</strong> {corp.isRequired ? '必要' : '不要（10万円以下）'}</div>
+                                                                        <div><strong>法人区分:</strong> {corp.rateBasis}</div>
+                                                                        <div className="mt-2 pt-2 border-t border-emerald-200">
+                                                                            <div className="font-semibold text-emerald-800 mb-1">予定申告方式（前年実績）</div>
+                                                                            <div className="text-xs space-y-1">
+                                                                                <div>法人税: {formatCurrency(corp.scheduledNationalTax)}円</div>
+                                                                                <div>地方法人税: {formatCurrency(corp.scheduledLocalTax)}円</div>
+                                                                                <div className="font-bold">納税予定額: {formatCurrency(corp.scheduledTotal)}円</div>
+                                                                            </div>
+                                                                        </div>
+                                                                        {corp.hasProvisionalInput && (
+                                                                            <div className="mt-2 pt-2 border-t border-emerald-200">
+                                                                                <div className="font-semibold text-emerald-800 mb-1">仮決算方式</div>
+                                                                                <div className="text-xs space-y-1">
+                                                                                    <div>法人税: {formatCurrency(corp.provisionalNationalTax)}円</div>
+                                                                                    <div>地方法人税: {formatCurrency(corp.provisionalLocalTax)}円</div>
+                                                                                    <div className="font-bold">納税予定額: {formatCurrency(corp.provisionalTotal)}円</div>
+                                                                                    {corp.provisionalNote && <p className="text-slate-600 mt-1">{corp.provisionalNote}</p>}
+                                                                                </div>
+                                                                                <p className="text-xs text-slate-500 mt-2">※仮決算額が予定申告額を超える場合は予定申告が有利な場合あり</p>
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })()}
 
                                                         {/* ⑤ 個社 月次CFテーブル・グラフ */}
                                                         <div className="space-y-4 mt-4">
