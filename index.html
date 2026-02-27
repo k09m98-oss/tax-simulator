@@ -43,7 +43,7 @@
         const { useState, useEffect } = React;
 
         // ローカルストレージキー
-        const STORAGE_KEY = 'tax_simulator_data_v5'; // v5: 画面から機能設定可能に
+        const STORAGE_KEY = 'tax_simulator_data_v6'; // v6: 労働保険年度更新追加
 
         // 初期会社データ（settingsでデフォルト社保料率を指定可能）
         const createInitialCompany = (id, name, settings = DEFAULT_SETTINGS) => ({
@@ -91,6 +91,12 @@
             // ① 期首現金（年初残高）
             beginningCash: 0,
 
+            // ①-2 期首売掛金の入金（サイト別・月次CFの入金に加算）
+            receivablesDay0: 0,   // 当月入金分（1月入金）
+            receivablesDay30: 0,  // 翌月入金分（2月入金）
+            receivablesDay60: 0,  // 2ヶ月後入金分（3月入金）
+            receivablesDay90: 0,  // 3ヶ月後入金分（4月入金）
+
             // ② 支払いサイト（月次CF用）
             salesPaymentDays: 0,      // A) 売上: 0/30/60/90日
             expensePaymentDays: 0,    // B) 販管費: 0/30/60/90日
@@ -112,8 +118,98 @@
             capitalAmount: 0,
             isLargeCorpSubsidiary: false,
             entityType: '普通法人',
-            interimIncome: 0
+            interimIncome: 0,
+
+            // 労働保険年度更新用
+            laborInsuranceIndustry: 'retail',        // 事業の種類
+            prevYearConfirmedWages: 0,               // 前年度確定賃金総額
+            prevYearEstimatedWages: 0,               // 前年度概算賃金（精算用・任意）
+            currYearEstimatedWages: 0,               // 当年度概算賃金総額見込額
+            laborInsuranceDelegation: false          // 労働保険事務組合への委託
         });
+
+        // 労働保険：業種別労災保険率（‰）、雇用保険率（事業主・労働者％）
+        const LABOR_INDUSTRY_RATES = {
+            retail:     { name: '小売業・卸売業・飲食店等', rosaRate: 2.5, empEmployer: 0.9, empWorker: 0.55 },
+            construction: { name: '建設業', rosaRate: 34, empEmployer: 1.1, empWorker: 0.65 },
+            manufacturing: { name: '製造業', rosaRate: 6, empEmployer: 0.9, empWorker: 0.55 },
+            forestry:   { name: '林業', rosaRate: 52, empEmployer: 1.0, empWorker: 0.65 },
+            finance:    { name: '金融・保険・不動産', rosaRate: 2.5, empEmployer: 0.9, empWorker: 0.55 },
+            transport:  { name: '交通運輸事業', rosaRate: 4, empEmployer: 0.9, empWorker: 0.55 },
+            other:      { name: 'その他一般', rosaRate: 3, empEmployer: 0.9, empWorker: 0.55 }
+        };
+        const ASBESTOS_RATE = 0.00002; // 一般拠出金 1000分の0.02
+
+        // 雇用保険労働者負担の端数処理（50銭以下切捨、50銭1厘以上切上）
+        const roundEmploymentWorker = (val) => {
+            const dec = val - Math.floor(val);
+            return dec <= 0.5 ? Math.floor(val) : Math.ceil(val);
+        };
+
+        // ============================================================
+        // 労働保険年度更新ロジック
+        // ============================================================
+        const LABOR_EXTEND_THRESHOLD = 400000;   // 延納閾値（両保険）
+        const LABOR_EXTEND_THRESHOLD_SINGLE = 200000;
+
+        const calculateLaborInsurance = (company, year) => {
+            const ind = LABOR_INDUSTRY_RATES[company.laborInsuranceIndustry] || LABOR_INDUSTRY_RATES.other;
+            const prevWages = company.prevYearConfirmedWages || 0;
+            const prevEstWages = company.prevYearEstimatedWages || prevWages; // 未入力時は確定額で推定
+            const currWages = company.currYearEstimatedWages || 0;
+            const delegated = !!company.laborInsuranceDelegation;
+
+            const rosaRate = ind.rosaRate / 1000;  // 労災保険率
+            const empEmployer = ind.empEmployer / 100;
+            const empWorker = ind.empWorker / 100;
+
+            // 当年度概算保険料
+            const rosaEstimated = Math.round(currWages * rosaRate);
+            const empEmployerEstimated = Math.round(currWages * empEmployer);
+            const empWorkerEstimated = roundEmploymentWorker(currWages * empWorker);
+            const asbestosEstimated = Math.round(currWages * ASBESTOS_RATE);
+            const employerPortion = rosaEstimated + empEmployerEstimated + asbestosEstimated;
+            const workerPortion = empWorkerEstimated;
+            const totalEstimated = employerPortion + workerPortion;
+
+            // 前年度確定保険料・前年度概算納付額
+            const prevRosa = Math.round(prevWages * rosaRate);
+            const prevEmpEmployer = Math.round(prevWages * empEmployer);
+            const prevEmpWorker = roundEmploymentWorker(prevWages * empWorker);
+            const prevAsbestos = Math.round(prevWages * ASBESTOS_RATE);
+            const prevConfirmedTotal = prevRosa + prevEmpEmployer + prevEmpWorker + prevAsbestos;
+            const prevEstRosa = Math.round(prevEstWages * rosaRate);
+            const prevEstEmpEmployer = Math.round(prevEstWages * empEmployer);
+            const prevEstEmpWorker = roundEmploymentWorker(prevEstWages * empWorker);
+            const prevEstAsbestos = Math.round(prevEstWages * ASBESTOS_RATE);
+            const prevEstimatedTotal = prevEstRosa + prevEstEmpEmployer + prevEstEmpWorker + prevEstAsbestos;
+            const prevSettlement = prevConfirmedTotal - prevEstimatedTotal; // 前年度精算差額
+
+            // 年度更新：当年度概算 + 前年度精算差額（マイナスは還付）
+            const annualUpdateTotal = totalEstimated + prevSettlement;
+
+            // 延納判定：概算40万以上、または事務組合委託。分割は年度更新納付額を3等分
+            const canExtend = totalEstimated >= LABOR_EXTEND_THRESHOLD || delegated;
+            const payAmount = Math.max(0, annualUpdateTotal);
+            const installments = canExtend && payAmount > 0 ? [
+                { period: 1, amount: Math.ceil(payAmount / 3), dueDate: `${year}年7月10日` },
+                { period: 2, amount: Math.ceil(payAmount / 3), dueDate: `${year}年10月31日` },
+                { period: 3, amount: payAmount - Math.ceil(payAmount / 3) * 2, dueDate: `${year + 1}年1月31日` }
+            ] : [];
+
+            return {
+                industryName: ind.name,
+                employerPortion,
+                workerPortion,
+                totalEstimated,
+                prevConfirmedTotal,
+                prevSettlement,
+                annualUpdateTotal,
+                dueDate: `${year}年6月1日～7月10日`,
+                canExtend,
+                installments
+            };
+        };
 
         // 免税事業者等からの仕入れにおける経過措置の控除率を取得
         // 図表1「免税事業者等からの仕入れにおける経過措置」に基づく（年月で判定）
@@ -429,6 +525,51 @@
         // サイト: 0日=当月, 30日=翌月, 60日=2ヶ月後, 90日=3ヶ月後
         const getMonthOffset = (days) => Math.floor((days || 0) / 30);
 
+        // 暦月(dueYear,dueMonth)を年度year・期首startMonthの月番号(1-12)に変換。年度内でなければ0
+        const calendarToFiscalMonth = (dueYear, dueMonth, year, startMonth) => {
+            const fyStart = startMonth || 4;
+            if (dueYear < year) return 0;
+            if (dueYear > year + 1) return 0;
+            if (dueYear === year && dueMonth >= fyStart) return dueMonth - fyStart + 1;
+            if (dueYear === year + 1 && dueMonth < fyStart) return dueMonth + (12 - fyStart + 1);
+            return 0;
+        };
+
+        // 中間消費税・法人税中間申告を月別出金として取得 { items: {month, amount, type}[], totalCorp, totalCons }
+        const getInterimTaxOutflowsByMonth = (company, year) => {
+            const startMonth = company.taxPeriodStartMonth || 4;
+            const items = [];
+            let totalCons = 0;
+            const ct = calculateInterimConsumptionTax(company, year);
+            if (ct.periods && ct.periods.length) {
+                ct.periods.forEach(p => {
+                    const amt = (p.consumptionTax || 0) + (p.localConsumptionTax || 0);
+                    totalCons += amt;
+                    const match = (p.dueDate || '').match(/(\d{4})年(\d{1,2})月/);
+                    if (match) {
+                        const dueYear = parseInt(match[1], 10);
+                        const dueMonth = parseInt(match[2], 10);
+                        const fm = calendarToFiscalMonth(dueYear, dueMonth, year, startMonth);
+                        if (fm >= 1 && fm <= 12) items.push({ month: fm, amount: amt, type: 'cons' });
+                    }
+                });
+            }
+            let totalCorp = 0;
+            const corp = calculateInterimCorporateTax(company);
+            if (corp.isRequired) {
+                const amt = corp.hasProvisionalInput ? (corp.provisionalNationalTax || 0) + (corp.provisionalLocalTax || 0) : (corp.scheduledNationalTax || 0) + (corp.scheduledLocalTax || 0);
+                if (amt > 0) {
+                    totalCorp = amt;
+                    const periodEndMonth = startMonth + 5;
+                    const dueMonth = periodEndMonth + 2 > 12 ? periodEndMonth - 10 : periodEndMonth + 2;
+                    const dueYear = periodEndMonth + 2 > 12 ? year + 1 : year;
+                    const fm = calendarToFiscalMonth(dueYear, dueMonth, year, startMonth);
+                    if (fm >= 1 && fm <= 12) items.push({ month: fm, amount: amt, type: 'corp' });
+                }
+            }
+            return { items, totalCorp, totalCons };
+        };
+
         const calculateMonthlyCashFlow = (company, year, settings = DEFAULT_SETTINGS) => {
             const kpi = calculateKPI(company, year, 1, settings);
             const {
@@ -458,17 +599,31 @@
             const monthlyLabor = (actualExecutiveCompensation + actualSalary
                 + (company.includeSocialInsurance ? totalSocialInsuranceCost : 0)) / 12;
 
+            const receivablesDay0 = company.receivablesDay0 || 0;
+            const receivablesDay30 = company.receivablesDay30 || 0;
+            const receivablesDay60 = company.receivablesDay60 || 0;
+            const receivablesDay90 = company.receivablesDay90 || 0;
+
+            const { items: interimTaxItems, totalCorp: totalInterimCorp, totalCons: totalInterimCons } = getInterimTaxOutflowsByMonth(company, year);
+            const finalCorporateTaxAmount = Math.max(0, corporateTax - totalInterimCorp);
+            const finalConsumptionTaxAmount = Math.max(0, consumptionTax - totalInterimCons);
+
             const result = [];
             let balance = beginningCash;
 
             for (let m = 1; m <= 12; m++) {
-                // 入金: 売上をサイト分ずらして計上
-                const inflow = (m - salesOffset >= 1) ? monthlySales : 0;
+                // 入金: 売上をサイト分ずらして計上 + 期首売掛金の入金（1月=0日分、2月=30日分、3月=60日分、4月=90日分）
+                let salesInflow = (m - salesOffset >= 1) ? monthlySales : 0;
+                const receivablesInflow = (m === 1 ? receivablesDay0 : m === 2 ? receivablesDay30 : m === 3 ? receivablesDay60 : m === 4 ? receivablesDay90 : 0);
+                const inflow = salesInflow + receivablesInflow;
 
-                // 出金: 販管費＋給与をサイト分ずらし＋税金（該当月のみ）
+                // 出金: 販管費＋給与をサイト分ずらし＋法人税・消費税（中間は当該月、確定は中間控除後の最終納付額）
                 const expenseOut = (m - expenseOffset >= 1) ? monthlyExpense : 0;
                 const laborOut = (m - salaryOffset >= 1) ? monthlyLabor : 0;
-                const taxOut = (m === corporateTaxMonth ? corporateTax : 0) + (m === consumptionTaxMonth ? consumptionTax : 0);
+                const finalCorporateTax = m === corporateTaxMonth ? finalCorporateTaxAmount : 0;
+                const finalConsumptionTax = m === consumptionTaxMonth ? finalConsumptionTaxAmount : 0;
+                const interimOut = interimTaxItems.filter(t => t.month === m).reduce((s, t) => s + t.amount, 0);
+                const taxOut = finalCorporateTax + finalConsumptionTax + interimOut;
 
                 const outflow = expenseOut + laborOut + taxOut;
                 const netCF = inflow - outflow;
@@ -484,6 +639,7 @@
             const monthlyData = companies.map(c => calculateMonthlyCashFlow(c, year, settings));
             const result = [];
             const groupBeginningCash = companies.reduce((sum, c) => sum + (c.beginningCash || 0), 0);
+            // 売掛金入金は各社分を月次で合算済み（calculateMonthlyCashFlowに含まれる）
             let balance = groupBeginningCash;
 
             for (let m = 1; m <= 12; m++) {
@@ -648,6 +804,7 @@
             useEffect(() => {
                 try {
                     let saved = localStorage.getItem(STORAGE_KEY);
+                    if (!saved) saved = localStorage.getItem('tax_simulator_data_v5');
                     if (!saved) saved = localStorage.getItem('tax_simulator_data_v4');
                     if (!saved) saved = localStorage.getItem('tax_simulator_data_v3');
                     if (!saved) saved = localStorage.getItem('tax_simulator_data_v2');
@@ -687,6 +844,10 @@
                             salarySocialInsurancePercent: company.salarySocialInsurancePercent || 15,
                             // 期首現金・サイト・税金支払月
                             beginningCash: company.beginningCash ?? 0,
+                            receivablesDay0: company.receivablesDay0 ?? 0,
+                            receivablesDay30: company.receivablesDay30 ?? 0,
+                            receivablesDay60: company.receivablesDay60 ?? 0,
+                            receivablesDay90: company.receivablesDay90 ?? 0,
                             salesPaymentDays: company.salesPaymentDays ?? 0,
                             expensePaymentDays: company.expensePaymentDays ?? 0,
                             salaryPaymentTerms: company.salaryPaymentTerms || 'current',
@@ -701,7 +862,12 @@
                             capitalAmount: company.capitalAmount ?? 0,
                             isLargeCorpSubsidiary: company.isLargeCorpSubsidiary ?? false,
                             entityType: company.entityType || '普通法人',
-                            interimIncome: company.interimIncome ?? 0
+                            interimIncome: company.interimIncome ?? 0,
+                            laborInsuranceIndustry: company.laborInsuranceIndustry || 'retail',
+                            prevYearConfirmedWages: company.prevYearConfirmedWages ?? 0,
+                            prevYearEstimatedWages: company.prevYearEstimatedWages ?? 0,
+                            currYearEstimatedWages: company.currYearEstimatedWages ?? 0,
+                            laborInsuranceDelegation: company.laborInsuranceDelegation ?? false
                         }));
                         setCompanies(companiesWithDefaults);
                         setSelectedCompanyId(data.selectedCompanyId || 1);
@@ -1038,17 +1204,45 @@
                                             </div>
                                         </div>
 
-                                        {/* ① 期首現金（年初残高） */}
+                                        {/* ① 期首現金・売掛金入金 */}
                                         <div className="bg-slate-50 p-4 rounded-lg">
-                                            <h3 className="font-semibold text-slate-700 mb-3">期首現金（年初残高）</h3>
-                                            <input
-                                                type="text"
-                                                value={formatInputValue(selectedCompany.beginningCash)}
-                                                onChange={(e) => updateCompany(selectedCompany.id, { beginningCash: parseNumber(e.target.value) })}
-                                                className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
-                                                placeholder="0"
-                                            />
-                                            <p className="text-xs text-slate-500 mt-1">※未入力は0円。月次CF計算の初期値</p>
+                                            <h3 className="font-semibold text-slate-700 mb-3">期首現金・売掛金入金</h3>
+                                            <div className="space-y-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">期首現金（年初残高・円）</label>
+                                                    <input
+                                                        type="text"
+                                                        value={formatInputValue(selectedCompany.beginningCash)}
+                                                        onChange={(e) => updateCompany(selectedCompany.id, { beginningCash: parseNumber(e.target.value) })}
+                                                        className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                        placeholder="0"
+                                                    />
+                                                    <p className="text-xs text-slate-500 mt-1">※月次CFの初期残高</p>
+                                                </div>
+                                                <div className="pt-3 border-t border-slate-200">
+                                                    <label className="block text-sm font-medium text-slate-700 mb-2">期首売掛金の入金（サイト別・円）</label>
+                                                    <p className="text-xs text-slate-500 mb-2">※1～4月にそれぞれ入金計上</p>
+                                                    <div className="grid grid-cols-2 gap-2">
+                                                        <div>
+                                                            <label className="block text-xs text-slate-600 mb-1">0日（1月入金）</label>
+                                                            <input type="text" value={formatInputValue(selectedCompany.receivablesDay0)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay0: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-xs text-slate-600 mb-1">30日（2月入金）</label>
+                                                            <input type="text" value={formatInputValue(selectedCompany.receivablesDay30)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay30: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-xs text-slate-600 mb-1">60日（3月入金）</label>
+                                                            <input type="text" value={formatInputValue(selectedCompany.receivablesDay60)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay60: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-xs text-slate-600 mb-1">90日（4月入金）</label>
+                                                            <input type="text" value={formatInputValue(selectedCompany.receivablesDay90)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay90: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
+                                                        </div>
+                                                    </div>
+                                                    <p className="text-xs text-slate-500 mt-2">売掛金合計: {formatCurrency((selectedCompany.receivablesDay0 || 0) + (selectedCompany.receivablesDay30 || 0) + (selectedCompany.receivablesDay60 || 0) + (selectedCompany.receivablesDay90 || 0))}円</p>
+                                                </div>
+                                            </div>
                                         </div>
 
                                         {/* ② 支払いサイト（月次CF用） */}
@@ -1200,6 +1394,36 @@
                                         </div>
                                         </>
                                         )}
+
+                                        {/* 労働保険年度更新（入力） */}
+                                        <div className="bg-sky-50 p-4 rounded-lg border border-sky-200">
+                                            <h3 className="font-semibold text-slate-700 mb-3">労働保険年度更新</h3>
+                                            <div className="space-y-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">1. 事業の種類</label>
+                                                    <select value={selectedCompany.laborInsuranceIndustry || 'retail'} onChange={(e) => updateCompany(selectedCompany.id, { laborInsuranceIndustry: e.target.value })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg">
+                                                        {Object.entries(LABOR_INDUSTRY_RATES).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">2. 前年度確定賃金総額（円）</label>
+                                                    <input type="text" value={formatInputValue(selectedCompany.prevYearConfirmedWages)} onChange={(e) => updateCompany(selectedCompany.id, { prevYearConfirmedWages: parseNumber(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-sky-500 focus:outline-none text-right" placeholder="0" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">3. 前年度概算賃金（円・任意）</label>
+                                                    <input type="text" value={formatInputValue(selectedCompany.prevYearEstimatedWages)} onChange={(e) => updateCompany(selectedCompany.id, { prevYearEstimatedWages: parseNumber(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-sky-500 focus:outline-none text-right" placeholder="0" />
+                                                    <p className="text-xs text-slate-500 mt-1">※未入力時は前年度確定額で算出</p>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-slate-700 mb-1">4. 当年度概算賃金総額見込額（円）</label>
+                                                    <input type="text" value={formatInputValue(selectedCompany.currYearEstimatedWages)} onChange={(e) => updateCompany(selectedCompany.id, { currYearEstimatedWages: parseNumber(e.target.value) })} className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-sky-500 focus:outline-none text-right" placeholder="0" />
+                                                </div>
+                                                <label className="flex items-center gap-2">
+                                                    <input type="checkbox" checked={selectedCompany.laborInsuranceDelegation ?? false} onChange={(e) => updateCompany(selectedCompany.id, { laborInsuranceDelegation: e.target.checked })} className="rounded" />
+                                                    <span className="text-sm text-slate-700">5. 労働保険事務組合への委託あり</span>
+                                                </label>
+                                            </div>
+                                        </div>
 
                                         {/* 数値入力 */}
                                         <div className="space-y-4">
@@ -1718,13 +1942,19 @@
                                                         {groupKPI.netProfit >= 0 ? '+' : ''}{formatCurrency(groupKPI.netProfit)}円
                                                     </div>
                                                 </div>
+                                                {(() => {
+                                                    const groupBeginningCash = companies.reduce((s, c) => s + (c.beginningCash || 0), 0);
+                                                    const groupActualCash = groupKPI.actualCash + groupBeginningCash;
+                                                    return (
                                                 <div className="bg-white/20 backdrop-blur rounded-lg p-4 border-2 border-white/30">
                                                     <div className="text-base opacity-90 mb-1 font-bold">💰 実質キャッシュ残高</div>
-                                                    <div className={`text-4xl font-bold ${groupKPI.actualCash >= 0 ? 'text-green-300' : 'text-red-300'}`}>
-                                                        {groupKPI.actualCash >= 0 ? '+' : ''}{formatCurrency(groupKPI.actualCash)}円
+                                                    <div className={`text-4xl font-bold ${groupActualCash >= 0 ? 'text-green-300' : 'text-red-300'}`}>
+                                                        {groupActualCash >= 0 ? '+' : ''}{formatCurrency(groupActualCash)}円
                                                     </div>
-                                                    <div className="text-xs opacity-75 mt-2">税込売上ベースで計算</div>
+                                                    <div className="text-xs opacity-75 mt-2">税込売上ベース＋期首現金</div>
                                                 </div>
+                                                    );
+                                                })()}
                                             </div>
 
                                             {settings.showMonthlyCFSection !== false && (
@@ -1855,6 +2085,44 @@
                                                         })()}
                                                         </>
                                                         )}
+
+                                                        {/* 労働保険年度更新（出力） */}
+                                                        {(() => {
+                                                            const labor = calculateLaborInsurance(selectedCompany, year);
+                                                            return (
+                                                                <div className="bg-sky-50 rounded-lg p-4 border-2 border-sky-200">
+                                                                    <h3 className="font-bold text-slate-800 mb-2">労働保険年度更新</h3>
+                                                                    <div className="space-y-2 text-sm">
+                                                                        <div><strong>事業の種類:</strong> {labor.industryName}</div>
+                                                                        <div className="mt-2 pt-2 border-t border-sky-200">
+                                                                            <div className="font-semibold text-sky-800 mb-1">1. 今年度概算保険料</div>
+                                                                            <div className="text-xs space-y-1">
+                                                                                <div>事業主負担: {formatCurrency(labor.employerPortion)}円</div>
+                                                                                <div>労働者負担: {formatCurrency(labor.workerPortion)}円</div>
+                                                                                <div className="font-bold">合計: {formatCurrency(labor.totalEstimated)}円</div>
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="pt-2 border-t border-sky-200">
+                                                                            <div className="font-semibold text-sky-800 mb-1">2. 年度更新納付額（納付期限: {labor.dueDate}）</div>
+                                                                            <div className="font-bold text-lg">{formatCurrency(labor.annualUpdateTotal)}円</div>
+                                                                            {labor.prevSettlement !== 0 && (
+                                                                                <p className="text-xs text-slate-600 mt-1">内 前年度精算: {formatCurrency(labor.prevSettlement)}円</p>
+                                                                            )}
+                                                                        </div>
+                                                                        {labor.canExtend && labor.installments.length > 0 && (
+                                                                            <div className="pt-2 border-t border-sky-200">
+                                                                                <div className="font-semibold text-sky-800 mb-1">3. 延納（3回分割）</div>
+                                                                                <div className="text-xs space-y-1">
+                                                                                    {labor.installments.map(p => (
+                                                                                        <div key={p.period}>{p.period}期: {formatCurrency(p.amount)}円（{p.dueDate}）</div>
+                                                                                    ))}
+                                                                                </div>
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })()}
 
                                                         {settings.showMonthlyCFSection !== false && (
                                                         <div className="space-y-4 mt-4">
