@@ -1204,48 +1204,51 @@
                                             </div>
                                         </div>
 
-                                        {/* ① 期首現金・売掛金入金 */}
+                                        {/* ① 期首現金 */}
                                         <div className="bg-slate-50 p-4 rounded-lg">
-                                            <h3 className="font-semibold text-slate-700 mb-3">期首現金・売掛金入金</h3>
-                                            <div className="space-y-3">
-                                                <div>
-                                                    <label className="block text-sm font-medium text-slate-700 mb-1">期首現金（年初残高・円）</label>
-                                                    <input
-                                                        type="text"
-                                                        value={formatInputValue(selectedCompany.beginningCash)}
-                                                        onChange={(e) => updateCompany(selectedCompany.id, { beginningCash: parseNumber(e.target.value) })}
-                                                        className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
-                                                        placeholder="0"
-                                                    />
-                                                    <p className="text-xs text-slate-500 mt-1">※月次CFの初期残高</p>
-                                                </div>
-                                                <div className="pt-3 border-t border-slate-200">
-                                                    <label className="block text-sm font-medium text-slate-700 mb-2">期首売掛金の入金（サイト別・円）</label>
-                                                    <p className="text-xs text-slate-500 mb-2">※1～4月にそれぞれ入金計上</p>
-                                                    <div className="grid grid-cols-2 gap-2">
-                                                        <div>
-                                                            <label className="block text-xs text-slate-600 mb-1">0日（1月入金）</label>
-                                                            <input type="text" value={formatInputValue(selectedCompany.receivablesDay0)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay0: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
-                                                        </div>
-                                                        <div>
-                                                            <label className="block text-xs text-slate-600 mb-1">30日（2月入金）</label>
-                                                            <input type="text" value={formatInputValue(selectedCompany.receivablesDay30)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay30: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
-                                                        </div>
-                                                        <div>
-                                                            <label className="block text-xs text-slate-600 mb-1">60日（3月入金）</label>
-                                                            <input type="text" value={formatInputValue(selectedCompany.receivablesDay60)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay60: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
-                                                        </div>
-                                                        <div>
-                                                            <label className="block text-xs text-slate-600 mb-1">90日（4月入金）</label>
-                                                            <input type="text" value={formatInputValue(selectedCompany.receivablesDay90)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay90: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
-                                                        </div>
-                                                    </div>
-                                                    <p className="text-xs text-slate-500 mt-2">売掛金合計: {formatCurrency((selectedCompany.receivablesDay0 || 0) + (selectedCompany.receivablesDay30 || 0) + (selectedCompany.receivablesDay60 || 0) + (selectedCompany.receivablesDay90 || 0))}円</p>
-                                                </div>
+                                            <h3 className="font-semibold text-slate-700 mb-3">期首現金</h3>
+                                            <div>
+                                                <label className="block text-sm font-medium text-slate-700 mb-1">年初残高（円）</label>
+                                                <input
+                                                    type="text"
+                                                    value={formatInputValue(selectedCompany.beginningCash)}
+                                                    onChange={(e) => updateCompany(selectedCompany.id, { beginningCash: parseNumber(e.target.value) })}
+                                                    className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:border-blue-500 focus:outline-none text-right"
+                                                    placeholder="0"
+                                                />
+                                                <p className="text-xs text-slate-500 mt-1">※月次CFの初期残高</p>
                                             </div>
                                         </div>
 
-                                        {/* ② 支払いサイト（月次CF用） */}
+                                        {/* ② 入金見込み */}
+                                        <div className="bg-slate-50 p-4 rounded-lg">
+                                            <h3 className="font-semibold text-slate-700 mb-3">入金見込み</h3>
+                                            <div>
+                                                <label className="block text-sm font-medium text-slate-700 mb-2">売掛の回収（サイト別・円）</label>
+                                                <p className="text-xs text-slate-500 mb-2">※1～4月にそれぞれ入金計上</p>
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div>
+                                                        <label className="block text-xs text-slate-600 mb-1">0日（1月入金）</label>
+                                                        <input type="text" value={formatInputValue(selectedCompany.receivablesDay0)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay0: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-xs text-slate-600 mb-1">30日（2月入金）</label>
+                                                        <input type="text" value={formatInputValue(selectedCompany.receivablesDay30)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay30: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-xs text-slate-600 mb-1">60日（3月入金）</label>
+                                                        <input type="text" value={formatInputValue(selectedCompany.receivablesDay60)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay60: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-xs text-slate-600 mb-1">90日（4月入金）</label>
+                                                        <input type="text" value={formatInputValue(selectedCompany.receivablesDay90)} onChange={(e) => updateCompany(selectedCompany.id, { receivablesDay90: parseNumber(e.target.value) })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-right text-sm" placeholder="0" />
+                                                    </div>
+                                                </div>
+                                                <p className="text-xs text-slate-500 mt-2">売掛金合計: {formatCurrency((selectedCompany.receivablesDay0 || 0) + (selectedCompany.receivablesDay30 || 0) + (selectedCompany.receivablesDay60 || 0) + (selectedCompany.receivablesDay90 || 0))}円</p>
+                                            </div>
+                                        </div>
+
+                                        {/* ③ 支払いサイト（月次CF用） */}
                                         <div className="bg-teal-50 p-4 rounded-lg">
                                             <h3 className="font-semibold text-slate-700 mb-3">支払いサイト（月次CF用）</h3>
                                             <div className="space-y-3">
